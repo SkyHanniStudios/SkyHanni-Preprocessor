@@ -18,9 +18,18 @@ plugins {
     groovy
     kotlin("jvm") version("2.0.0")
     `kotlin-dsl`
-    val dgtVersion = "2.22.0"
-    id("dev.deftu.gradle.tools") version(dgtVersion)
-    id("dev.deftu.gradle.tools.publishing.maven") version(dgtVersion)
+    `java-gradle-plugin`
+    `maven-publish`
+}
+
+group = "com.github.skyhanni"
+version = "0.8.0"
+val githubProjectName = "preprocess-plugin"
+
+kotlin {
+    jvmToolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
 }
 
 val kotestVersion: String by project.extra
@@ -32,6 +41,7 @@ java {
 repositories {
     mavenLocal()
     mavenCentral()
+    gradlePluginPortal()
     maven(url = "https://jitpack.io/")
     maven(url = "https://maven.fabricmc.net/")
     maven(url = "https://maven.deftu.dev/releases/")
@@ -48,14 +58,26 @@ dependencies {
 
 gradlePlugin {
     plugins {
-        register("preprocess-plugin") {
-            id = "com.github.skyhanni.preprocess"
+        register("PreprocessPlugin") {
+            id = "$group.$githubProjectName"
             implementationClass = "com.replaymod.gradle.preprocess.PreprocessPlugin"
         }
 
-        register("preprocess-root-plugin") {
-            id = "com.github.skyhanni.preprocess-root"
-            implementationClass = "com.replaymod.gradle.preprocess.RootPreprocessPlugin"
+//        register("RootPreprocessPlugin") {
+//            id = "$group.$githubProjectName-root"
+//            implementationClass = "com.replaymod.gradle.preprocess.RootPreprocessPlugin"
+//        }
+    }
+}
+
+publishing {
+    publications {
+        create<MavenPublication>("plugin") {
+            groupId = "$group"
+            artifactId = githubProjectName
+            version = "${project.version}"
+
+            from(components["java"])
         }
     }
 }
