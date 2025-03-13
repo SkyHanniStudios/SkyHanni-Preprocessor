@@ -22,9 +22,9 @@ plugins {
     `maven-publish`
 }
 
-group = "com.github.skyhanni"
+group = "com.github.SkyHanniStudios"
 version = "0.8.1"
-val githubProjectName = "preprocess-plugin"
+val githubProjectName = "SkyHanni-Preprocessor"
 
 kotlin {
     jvmToolchain {
