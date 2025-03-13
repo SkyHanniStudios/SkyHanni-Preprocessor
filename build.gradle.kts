@@ -32,7 +32,7 @@ kotlin {
     }
 }
 
-val kotestVersion: String by project.extra
+val kotestVersion = "4.2.2"
 
 java {
     withSourcesJar()
