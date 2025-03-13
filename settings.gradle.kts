@@ -1,5 +1,3 @@
-import groovy.lang.MissingPropertyException
-
 pluginManagement {
     repositories {
         mavenLocal()
@@ -15,4 +13,8 @@ pluginManagement {
     }
 }
 
-rootProject.name = extra["project.name"]?.toString() ?: throw MissingPropertyException("The project name was not configured!")
+rootProject.name = "studios.skyhanni.preprocess.gradle.plugin"
+
+plugins {
+    id("org.gradle.toolchains.foojay-resolver-convention") version ("0.7.0")
+}
