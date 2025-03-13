@@ -48,13 +48,13 @@ dependencies {
 
 gradlePlugin {
     plugins {
-        register("preprocess") {
-            id = "dev.deftu.gradle.preprocess"
+        register("preprocess-plugin") {
+            id = "com.github.skyhanni.preprocess"
             implementationClass = "com.replaymod.gradle.preprocess.PreprocessPlugin"
         }
 
-        register("preprocess-root") {
-            id = "dev.deftu.gradle.preprocess-root"
+        register("preprocess-root-plugin") {
+            id = "com.github.skyhanni.preprocess-root"
             implementationClass = "com.replaymod.gradle.preprocess.RootPreprocessPlugin"
         }
     }
