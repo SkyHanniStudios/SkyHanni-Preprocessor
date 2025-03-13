@@ -18,7 +18,7 @@ plugins {
     groovy
     kotlin("jvm") version("2.0.0")
     `kotlin-dsl`
-    val dgtVersion = "2.5.0"
+    val dgtVersion = "2.22.0"
     id("dev.deftu.gradle.tools") version(dgtVersion)
     id("dev.deftu.gradle.tools.publishing.maven") version(dgtVersion)
 }
@@ -40,7 +40,7 @@ repositories {
 dependencies {
     implementation(gradleApi())
     implementation(localGroovy())
-    implementation("dev.deftu:remap:0.3.0")
+    implementation("com.github.SkyHanniStudios:SkyHanni-Remap:0.4.0")
     implementation("net.fabricmc:mapping-io:0.6.1")
     testImplementation("io.kotest:kotest-runner-junit5-jvm:$kotestVersion")
     testImplementation("io.kotest:kotest-assertions-core-jvm:$kotestVersion")

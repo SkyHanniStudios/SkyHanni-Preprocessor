@@ -1,3 +1,7 @@
+### This fork
+
+This fork adds support for patterns to semi work in kotlin files
+
 ### The Preprocessor
 To support multiple Minecraft versions with the ReplayMod, a [JCP](https://github.com/raydac/java-comment-preprocessor)-inspired preprocessor is used:
 ```java

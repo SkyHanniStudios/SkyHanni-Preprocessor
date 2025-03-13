@@ -1,5 +1,6 @@
 package com.replaymod.gradle.preprocess
 
+import com.replaymod.gradle.remap.PatternMapping
 import com.replaymod.gradle.remap.Transformer
 import com.replaymod.gradle.remap.legacy.LegacyMapping
 import com.replaymod.gradle.remap.legacy.LegacyMappingSetModelFactory
@@ -127,6 +128,10 @@ open class PreprocessTask @Inject constructor(
 
     @Input
     var reverseMapping: Boolean = false
+
+    @Input
+    @Optional
+    var mappingsList: List<PatternMapping> = emptyList()
 
     @InputDirectory
     @Optional
@@ -260,7 +265,7 @@ open class PreprocessTask @Inject constructor(
         }
         if (mappings != null) {
             classpath!!
-            val javaTransformer = Transformer(mappings)
+            val javaTransformer = Transformer(mappings, mappingsList)
             javaTransformer.verboseCompilerMessages = logger.isInfoEnabled
             javaTransformer.patternAnnotation = patternAnnotation.orNull
             javaTransformer.manageImports = manageImports.getOrElse(false)

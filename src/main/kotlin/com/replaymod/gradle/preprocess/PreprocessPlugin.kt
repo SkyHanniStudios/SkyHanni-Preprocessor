@@ -1,5 +1,6 @@
 package com.replaymod.gradle.preprocess
 
+import com.replaymod.gradle.remap.PatternMapping
 import net.fabricmc.mappingio.MappingReader
 import net.fabricmc.mappingio.tree.MemoryMappingTree
 import org.cadixdev.lorenz.MappingSet
@@ -23,10 +24,40 @@ import org.gradle.kotlin.dsl.*
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.nio.file.Path
 import java.util.stream.Collectors
 
 class PreprocessPlugin : Plugin<Project> {
+
+    private val patternMappingsList = mutableListOf<PatternMapping>()
+
+    private fun processPatternMappings(mappingFile: File?, patternMappings: File?): File? {
+        if (mappingFile == null || patternMappings == null) {
+            return mappingFile
+        }
+
+        val tempMappingFile = Files.createTempFile("tempMapping", ".txt").toFile()
+        tempMappingFile.deleteOnExit()
+        tempMappingFile.writeText(mappingFile.readText())
+
+        for (line in patternMappings.readLines()) {
+            if (line.trim { it <= ' ' }.startsWith("#") || line.trim { it <= ' ' }.isEmpty()) continue
+
+            val parts = line.split(" ".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
+
+            require(parts.size == 5)
+
+            val patternMapping = PatternMapping(parts[0], parts[1], parts[2], parts[3], parts[4])
+            val classMapping = "${patternMapping.newClass} ${patternMapping.oldClass}"
+            val methodMapping = "${patternMapping.newClass} ${patternMapping.newMethod} ${patternMapping.oldMethod}"
+
+            tempMappingFile.appendText("\n$classMapping\n$methodMapping")
+            patternMappingsList.add(patternMapping)
+        }
+        return tempMappingFile
+    }
+
     override fun apply(project: Project) {
         val parent = project.parent
         if (parent == null) {
@@ -43,7 +74,7 @@ class PreprocessPlugin : Plugin<Project> {
         val coreProject = coreProjectFile.readText().trim()
         val mcVersion = projectNode.mcVersion
         project.extra["mcVersion"] = mcVersion
-        val ext = project.extensions.create("preprocess", PreprocessExtension::class, project, project.objects, mcVersion)
+        val ext = project.extensions.create("preprocess", PreprocessExtension::class, project.objects, mcVersion)
 
         val kotlin = project.plugins.hasPlugin("kotlin")
 
@@ -63,7 +94,8 @@ class PreprocessPlugin : Plugin<Project> {
         } else {
             val inheritedLink = projectNode.links.find { it.first.findNode(coreProject) != null }
             val (inheritedNode, extraMappings) = inheritedLink ?: graph.findParent(projectNode)!!
-            val (mappingFile, mappingFileInverted) = extraMappings
+            val (mappingFile, mappingFileInverted, patternMappings) = extraMappings
+            val newMappingFile = processPatternMappings(mappingFile, patternMappings)
             val reverseMappings = (inheritedLink != null) != mappingFileInverted
             val inherited = parent.evaluationDependsOn(inheritedNode.project)
 
@@ -98,8 +130,9 @@ class PreprocessPlugin : Plugin<Project> {
                     remappedjdkHome.set((project.tasks["compileJava"] as JavaCompile).javaCompiler.map { it.metadata.installationPath })
                     classpath = inherited.tasks["compile${cName}${if (kotlin) "Kotlin" else "Java"}"].classpath
                     remappedClasspath = project.tasks["compile${cName}${if (kotlin) "Kotlin" else "Java"}"].classpath
-                    mapping = mappingFile
+                    mapping = newMappingFile
                     reverseMapping = reverseMappings
+                    mappingsList = patternMappingsList
                     vars.convention(ext.vars)
                     keywords.convention(ext.keywords)
                     patternAnnotation.convention(ext.patternAnnotation)

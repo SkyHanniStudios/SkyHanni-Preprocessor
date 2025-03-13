@@ -39,7 +39,7 @@ open class RootPreprocessExtension(project: Project, objects: ObjectFactory) : P
         return first.breadthFirstSearch()
     }
 
-    override fun addNode(project: String, mcVersion: Int, mappings: String, extraMappings: File?, invertMappings: Boolean): ProjectGraphNode {
+    override fun addNode(project: String, mcVersion: Int, mappings: String, extraMappings: File?, invertMappings: Boolean, patternMappings: File?): ProjectGraphNode {
         check(rootNode == null) { "Only one root node may be set." }
         check(extraMappings == null) { "Cannot add extra mappings to root node." }
         return ProjectGraphNode(project, mcVersion, mappings).also { rootNode = it }
@@ -51,11 +51,11 @@ class Node(
     val mcVersion: Int,
     val mappings: String,
 ) {
-    internal val links = mutableMapOf<Node, Pair<File?, Boolean>>()
+    internal val links = mutableMapOf<Node, Triple<File?, Boolean, File?>>()
 
-    fun link(other: Node, extraMappings: File? = null) {
-        this.links[other] = Pair(extraMappings, false)
-        other.links[this] = Pair(extraMappings, true)
+    fun link(other: Node, extraMappings: File? = null, patternMappings: File? = null) {
+        this.links[other] = Triple(extraMappings, false, patternMappings)
+        other.links[this] = Triple(extraMappings, true, patternMappings)
     }
 }
 
@@ -64,17 +64,17 @@ interface ProjectGraphNodeDSL {
         addNode(this, mcVersion, mappings, extraMappings).configure()
     }
 
-    fun addNode(project: String, mcVersion: Int, mappings: String, extraMappings: File? = null, invertMappings: Boolean = false): ProjectGraphNodeDSL
+    fun addNode(project: String, mcVersion: Int, mappings: String, extraMappings: File? = null, invertMappings: Boolean = false, patternMappings: File? = null): ProjectGraphNodeDSL
 }
 
 open class ProjectGraphNode(
     val project: String,
     val mcVersion: Int,
     val mappings: String,
-    val links: MutableList<Pair<ProjectGraphNode, Pair<File?, Boolean>>> = mutableListOf()
+    val links: MutableList<Pair<ProjectGraphNode, Triple<File?, Boolean, File?>>> = mutableListOf(),
 ) : ProjectGraphNodeDSL {
-    override fun addNode(project: String, mcVersion: Int, mappings: String, extraMappings: File?, invertMappings: Boolean): ProjectGraphNodeDSL =
-        ProjectGraphNode(project, mcVersion, mappings).also { links.add(Pair(it, Pair(extraMappings, invertMappings))) }
+    override fun addNode(project: String, mcVersion: Int, mappings: String, extraMappings: File?, invertMappings: Boolean, patternMappings: File?): ProjectGraphNodeDSL =
+        ProjectGraphNode(project, mcVersion, mappings).also { links.add(Pair(it, Triple(extraMappings, invertMappings, patternMappings))) }
 
     fun findNode(project: String): ProjectGraphNode? = if (project == this.project) {
         this
@@ -82,7 +82,7 @@ open class ProjectGraphNode(
         links.map { it.first.findNode(project) }.find { it != null }
     }
 
-    fun findParent(node: ProjectGraphNode): Pair<ProjectGraphNode, Pair<File?, Boolean>>? = if (node == this) {
+    fun findParent(node: ProjectGraphNode): Pair<ProjectGraphNode, Triple<File?, Boolean, File?>>? = if (node == this) {
         null
     } else {
         links.map { (child, extraMappings) ->
