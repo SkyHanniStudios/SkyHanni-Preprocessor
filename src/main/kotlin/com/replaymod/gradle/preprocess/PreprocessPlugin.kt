@@ -12,6 +12,7 @@ import org.gradle.api.Project
 import org.gradle.api.Task
 import org.gradle.api.file.Directory
 import org.gradle.api.file.FileCollection
+import org.gradle.api.file.RegularFile
 import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.file.SourceDirectorySet
 import org.gradle.api.provider.Property
@@ -32,12 +33,16 @@ class PreprocessPlugin : Plugin<Project> {
 
     private val patternMappingsList = mutableListOf<PatternMapping>()
 
-    private fun processPatternMappings(mappingFile: File?, patternMappings: File?): File? {
+    private fun processPatternMappings(
+        mappingFile: File?,
+        patternMappings: File?,
+        destination: Provider<RegularFile>
+    ): File? {
         if (mappingFile == null || patternMappings == null) {
             return mappingFile
         }
 
-        val tempMappingFile = Files.createTempFile("tempMapping", ".txt").toFile()
+        val tempMappingFile = destination.get().asFile
         tempMappingFile.deleteOnExit()
         tempMappingFile.writeText(mappingFile.readText())
 
@@ -68,7 +73,8 @@ class PreprocessPlugin : Plugin<Project> {
         project.evaluationDependsOn(parent.path)
         val rootExtension = parent.extensions.getByType<RootPreprocessExtension>()
         val graph = rootExtension.rootNode ?: throw IllegalStateException("Preprocess graph was not configured.")
-        val projectNode = graph.findNode(project.name) ?: throw IllegalStateException("Prepocess graph does not contain ${project.name}.")
+        val projectNode = graph.findNode(project.name)
+            ?: throw IllegalStateException("Prepocess graph does not contain ${project.name}.")
 
         val coreProjectFile = rootExtension.mainProjectFile.asFile.get()
         val coreProject = coreProjectFile.readText().trim()
@@ -95,7 +101,6 @@ class PreprocessPlugin : Plugin<Project> {
             val inheritedLink = projectNode.links.find { it.first.findNode(coreProject) != null }
             val (inheritedNode, extraMappings) = inheritedLink ?: graph.findParent(projectNode)!!
             val (mappingFile, mappingFileInverted, patternMappings) = extraMappings
-            val newMappingFile = processPatternMappings(mappingFile, patternMappings)
             val reverseMappings = (inheritedLink != null) != mappingFileInverted
             val inherited = parent.evaluationDependsOn(inheritedNode.project)
 
@@ -109,6 +114,7 @@ class PreprocessPlugin : Plugin<Project> {
                 val generatedKotlin = preprocessedRoot.dir("kotlin")
                 val generatedJava = preprocessedRoot.dir("java")
                 val generatedResources = preprocessedRoot.dir("resources")
+                val mappingTempPath = project.layout.buildDirectory.file("tempMapping.txt")
 
                 val preprocessCode = project.tasks.register<PreprocessTask>("preprocess${cName}Code") {
                     inherited.tasks.findByPath("preprocess${cName}Code")?.let { dependsOn(it) }
@@ -130,7 +136,12 @@ class PreprocessPlugin : Plugin<Project> {
                     remappedjdkHome.set((project.tasks["compileJava"] as JavaCompile).javaCompiler.map { it.metadata.installationPath })
                     classpath = inherited.tasks["compile${cName}${if (kotlin) "Kotlin" else "Java"}"].classpath
                     remappedClasspath = project.tasks["compile${cName}${if (kotlin) "Kotlin" else "Java"}"].classpath
-                    mapping = newMappingFile
+                    inputs.files(mappingFile, patternMappings)
+                    mapping = processPatternMappings(
+                        mappingFile,
+                        patternMappings,
+                        mappingTempPath
+                    )
                     reverseMapping = reverseMappings
                     mappingsList = patternMappingsList
                     vars.convention(ext.vars)
@@ -144,7 +155,7 @@ class PreprocessPlugin : Plugin<Project> {
 
                 if (kotlin) {
                     val kotlinConsumerTask = project.tasks.findByName("source${name.uppercaseFirstChar()}Kotlin")
-                            ?: project.tasks["compile${cName}Kotlin"]
+                        ?: project.tasks["compile${cName}Kotlin"]
                     kotlinConsumerTask.dependsOn(preprocessCode)
                     withGroovyBuilder { getProperty("kotlin") as SourceDirectorySet }.setSrcDirs(
                         listOf(
@@ -181,8 +192,10 @@ class PreprocessPlugin : Plugin<Project> {
 
             project.afterEvaluate {
                 if ("genSrgs" in project.tasks.names || "createMcpToSrg" in project.tasks.names) {
-                    logger.warn("ForgeGradle compatibility in Preprocessor is deprecated." +
-                        "Consider switching to architectury-loom (or essential-loom for FG2).")
+                    logger.warn(
+                        "ForgeGradle compatibility in Preprocessor is deprecated." +
+                                "Consider switching to architectury-loom (or essential-loom for FG2)."
+                    )
                     if (rootExtension.strictExtraMappings.getOrElse(false)) {
                         throw UnsupportedOperationException("Strict mappings are only supported with Loom.")
                     }
@@ -207,10 +220,12 @@ class PreprocessPlugin : Plugin<Project> {
                     }
 
                     if (!rootExtension.strictExtraMappings.isPresent) {
-                        logger.warn("Legacy extra mappings are deprecated. " +
-                            "Please consider enabling strict extra mappings via " +
-                            "`preprocess.strictExtraMappings.set(true)` in your root project. " +
-                            "You may suppress this message by explicitly setting it to `false`.")
+                        logger.warn(
+                            "Legacy extra mappings are deprecated. " +
+                                    "Please consider enabling strict extra mappings via " +
+                                    "`preprocess.strictExtraMappings.set(true)` in your root project. " +
+                                    "You may suppress this message by explicitly setting it to `false`."
+                        )
                     }
                     return@afterEvaluate
                 }
@@ -221,18 +236,39 @@ class PreprocessPlugin : Plugin<Project> {
                 val inheritedIntermediaryMappings = inherited.intermediaryMappings
                 val projectNotchMappings = project.notchMappings
                 val inheritedNotchMappings = inherited.notchMappings
-                val sourceSrg = project.layout.buildDirectory.get().asFile.resolve(prepareTaskName).resolve("source.srg")
-                val destinationSrg = project.layout.buildDirectory.get().asFile.resolve(prepareTaskName).resolve("destination.srg")
+                val sourceSrg =
+                    project.layout.buildDirectory.get().asFile.resolve(prepareTaskName).resolve("source.srg")
+                val destinationSrg =
+                    project.layout.buildDirectory.get().asFile.resolve(prepareTaskName).resolve("destination.srg")
                 val (prepareSourceTask, prepareDestTask) = if (inheritedIntermediaryMappings.type == projectIntermediaryMappings.type) {
                     Pair(
-                        bakeNamedToIntermediaryMappings(prepareSourceTaskName, inheritedIntermediaryMappings, sourceSrg),
-                        bakeNamedToIntermediaryMappings(prepareDestTaskName, projectIntermediaryMappings, destinationSrg),
+                        bakeNamedToIntermediaryMappings(
+                            prepareSourceTaskName,
+                            inheritedIntermediaryMappings,
+                            sourceSrg
+                        ),
+                        bakeNamedToIntermediaryMappings(
+                            prepareDestTaskName,
+                            projectIntermediaryMappings,
+                            destinationSrg
+                        ),
                     )
                 } else if (inheritedNotchMappings != null && projectNotchMappings != null
-                        && inheritedNode.mcVersion == projectNode.mcVersion) {
+                    && inheritedNode.mcVersion == projectNode.mcVersion
+                ) {
                     Pair(
-                        bakeNamedToOfficialMappings(prepareSourceTaskName, inheritedNotchMappings, inheritedIntermediaryMappings, sourceSrg),
-                        bakeNamedToOfficialMappings(prepareDestTaskName, projectNotchMappings, projectIntermediaryMappings, destinationSrg),
+                        bakeNamedToOfficialMappings(
+                            prepareSourceTaskName,
+                            inheritedNotchMappings,
+                            inheritedIntermediaryMappings,
+                            sourceSrg
+                        ),
+                        bakeNamedToOfficialMappings(
+                            prepareDestTaskName,
+                            projectNotchMappings,
+                            projectIntermediaryMappings,
+                            destinationSrg
+                        ),
                     )
                 } else {
                     throw IllegalStateException("Failed to find mappings from $inherited to $project.")
@@ -327,6 +363,7 @@ internal class MappingsFile(
     @PathSensitive(PathSensitivity.NONE)
     val file: File,
 )
+
 private fun Mappings.toFile() = MappingsFile(type, format, file)
 
 @CacheableTask
@@ -378,7 +415,11 @@ internal abstract class BakeNamedToOfficialMappings : DefaultTask() {
     }
 }
 
-private fun Project.bakeNamedToIntermediaryMappings(name: String, namedToIntermediaryMappings: Mappings, destination: File): TaskProvider<BakeNamedToIntermediaryMappings> {
+private fun Project.bakeNamedToIntermediaryMappings(
+    name: String,
+    namedToIntermediaryMappings: Mappings,
+    destination: File
+): TaskProvider<BakeNamedToIntermediaryMappings> {
     val task = tasks.register(name, BakeNamedToIntermediaryMappings::class)
     task.configure {
         dependsOn(namedToIntermediaryMappings.tasks)
@@ -388,7 +429,12 @@ private fun Project.bakeNamedToIntermediaryMappings(name: String, namedToInterme
     return task
 }
 
-private fun Project.bakeNamedToOfficialMappings(name: String, mappings: Mappings, namedToIntermediaryMappings: Mappings?, destination: File): TaskProvider<BakeNamedToOfficialMappings> {
+private fun Project.bakeNamedToOfficialMappings(
+    name: String,
+    mappings: Mappings,
+    namedToIntermediaryMappings: Mappings?,
+    destination: File
+): TaskProvider<BakeNamedToOfficialMappings> {
     val task = tasks.register(name, BakeNamedToOfficialMappings::class)
     task.configure {
         dependsOn(mappings.tasks, namedToIntermediaryMappings?.tasks)
@@ -515,4 +561,5 @@ private fun Provider<Directory>.dir(path: String): Provider<Directory> =
 
 private fun String.uppercaseFirstChar() = replaceFirstChar { it.uppercaseChar() }
 
-private fun Any.maybeGetGroovyProperty(name: String) = withGroovyBuilder { metaClass }.hasProperty(this, name)?.getProperty(this)
+private fun Any.maybeGetGroovyProperty(name: String) =
+    withGroovyBuilder { metaClass }.hasProperty(this, name)?.getProperty(this)

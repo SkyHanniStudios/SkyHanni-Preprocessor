@@ -11,14 +11,14 @@ import net.fabricmc.mappingio.tree.MemoryMappingTree
 import org.cadixdev.lorenz.MappingSet
 import org.gradle.api.DefaultTask
 import org.gradle.api.GradleException
-import org.gradle.api.file.FileCollection
-import org.gradle.api.file.FileSystemOperations
-import org.gradle.api.file.FileTree
-import org.gradle.api.file.ProjectLayout
+import org.gradle.api.file.*
 import org.gradle.api.model.ObjectFactory
 import org.gradle.api.tasks.*
 import org.gradle.kotlin.dsl.mapProperty
 import org.gradle.kotlin.dsl.property
+import org.gradle.work.ChangeType
+import org.gradle.work.Incremental
+import org.gradle.work.InputChanges
 import org.jetbrains.kotlin.backend.common.peek
 import org.jetbrains.kotlin.backend.common.pop
 import org.jetbrains.kotlin.backend.common.push
@@ -84,24 +84,20 @@ open class PreprocessTask @Inject constructor(
     @Internal
     var entries: MutableList<InOut> = mutableListOf()
 
-    @InputFiles
-    @SkipWhenEmpty
-    @PathSensitive(PathSensitivity.RELATIVE)
-    fun getSourceFileTrees(): List<FileTree> {
-        return entries.flatMap { it.source }.map { layout.files(it).asFileTree }
-    }
+    @get:Incremental
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    val sourceFiles: ConfigurableFileCollection = objects.fileCollection()
+
 
     @InputFiles
     @Optional
     @PathSensitive(PathSensitivity.RELATIVE)
-    fun getOverwritesFileTrees(): List<FileTree> {
-        return entries.mapNotNull { it.overwrites?.let { layout.files(it).asFileTree } }
-    }
+    fun getOverwritesFileTrees(): List<FileTree> =
+        entries.mapNotNull { it.overwrites?.let { layout.files(it).asFileTree } }
 
     @OutputDirectories
-    fun getGeneratedDirectories(): List<File> {
-        return entries.map { it.generated }
-    }
+    fun getGeneratedDirectories(): List<File> = entries.map { it.generated }
 
     @InputFile
     @Optional
@@ -169,17 +165,68 @@ open class PreprocessTask @Inject constructor(
 
     fun entry(source: FileCollection, generated: File, overwrites: File) {
         entries.add(InOut(source, generated, overwrites))
+        sourceFiles.from(source)
     }
 
     @TaskAction
-    fun preprocess() {
-        preprocess(mapping, entries)
+    fun preprocess(inputChanges: InputChanges) {
+
+        if (!inputChanges.isIncremental) {
+            logger.lifecycle("Full Preprocess Run")
+            preprocessAll(mapping, entries)
+            return
+        }
+        val changedFiles = inputChanges.getFileChanges(sourceFiles).associate { it.file to it.changeType }
+        logger.lifecycle("Incremental Preprocess Run with ${changedFiles.size} changes")
+
+        val sourceFiles: List<Entry> = changedFiles.flatMap { (file, change) ->
+            if (change == ChangeType.REMOVED) {
+                fsops.delete {
+                    delete(file)
+                }
+                return@flatMap emptyList()
+            }
+
+            entries.firstOrNull {
+                it.source.contains(file)
+            }?.let { inOut ->
+                val outBasePath = inOut.generated.toPath()
+                val overwritesBasePath = inOut.overwrites?.toPath()
+                val inBasePath = file.toPath()
+                layout.files(file).asFileTree.map { f ->
+                    val relPath = inBasePath.relativize(f.toPath())
+                    Entry(relPath.toString(), inBasePath, outBasePath, overwritesBasePath)
+                }
+            } ?: emptyList()
+        }
+
+//        val sourceFiles: List<Entry> = entries.flatMap { inOut ->
+//            val outBasePath = inOut.generated.toPath()
+//            val overwritesBasePath = inOut.overwrites?.toPath()
+//            inOut.source.flatMap inner@{ inBase ->
+//                val changes = changedFiles[inBase] ?: return@inner emptyList()
+//                if (changes == ChangeType.REMOVED) {
+//                    fsops.delete {
+//                        delete(inBase)
+//                    }
+//                    return@inner emptyList()
+//                }
+//                val inBasePath = inBase.toPath()
+//                layout.files(inBase).asFileTree.map { file ->
+//                    val relPath = inBasePath.relativize(file.toPath())
+//                    Entry(relPath.toString(), inBasePath, outBasePath, overwritesBasePath)
+//                }
+//            }
+//        }
+
+        logger.lifecycle("sourceFiles: $sourceFiles")
+
+        preprocess(mapping, entries, sourceFiles)
     }
 
-    fun preprocess(mapping: File?, entries: List<InOut>) {
-        data class Entry(val relPath: String, val inBase: Path, val outBase: Path, val overwritesBase: Path?)
+    fun preprocessAll(mapping: File?, entries: List<InOut>) {
 
-        val sourceFiles: List<Entry> = entries.flatMap { inOut ->
+        val sourceFiles = entries.flatMap { inOut ->
             val outBasePath = inOut.generated.toPath()
             val overwritesBasePath = inOut.overwrites?.toPath()
             inOut.source.flatMap { inBase ->
@@ -191,78 +238,88 @@ open class PreprocessTask @Inject constructor(
             }
         }
 
+        preprocess(mapping, entries, sourceFiles)
+    }
+
+    private data class Entry(val relPath: String, val inBase: Path, val outBase: Path, val overwritesBase: Path?)
+
+    private fun preprocess(mapping: File?, entries: List<InOut>, sourceFiles: List<Entry>) {
+
         var mappedSources: Map<String, Pair<String, List<Pair<Int, String>>>>? = null
 
         val classpath = classpath
         val sourceMappingsFile = sourceMappings
         val destinationMappingsFile = destinationMappings
-        val mappings = if (intermediateMappingsName.isPresent && classpath != null && sourceMappingsFile != null && destinationMappingsFile != null) {
-            val sharedMappingsNamespace = intermediateMappingsName.get()
-            val srcTree = MemoryMappingTree().also { MappingReader.read(sourceMappingsFile.toPath(), it) }
-            val dstTree = MemoryMappingTree().also { MappingReader.read(destinationMappingsFile.toPath(), it) }
-            if (strictExtraMappings.get()) {
-                if (sharedMappingsNamespace == "srg") {
-                    inferSharedClassMappings(srcTree, dstTree, sharedMappingsNamespace)
-                }
-                srcTree.setIndexByDstNames(true)
-                dstTree.setIndexByDstNames(true)
-                val extTree = mapping?.let { file ->
-                    try {
-                        val ast = ExtraMapping.read(file.toPath())
-                        if (!reverseMapping) {
-                            ast.resolve(logger, srcTree, dstTree, "named", sharedMappingsNamespace).first
-                        } else {
-                            ast.resolve(logger, dstTree, srcTree, "named", sharedMappingsNamespace).second
-                        }
-                    } catch (e: Exception) {
-                        throw GradleException("Failed to parse $file: ${e.message}", e)
+        val mappings =
+            if (intermediateMappingsName.isPresent && classpath != null && sourceMappingsFile != null && destinationMappingsFile != null) {
+                val sharedMappingsNamespace = intermediateMappingsName.get()
+                val srcTree = MemoryMappingTree().also { MappingReader.read(sourceMappingsFile.toPath(), it) }
+                val dstTree = MemoryMappingTree().also { MappingReader.read(destinationMappingsFile.toPath(), it) }
+                if (strictExtraMappings.get()) {
+                    if (sharedMappingsNamespace == "srg") {
+                        inferSharedClassMappings(srcTree, dstTree, sharedMappingsNamespace)
                     }
-                } ?: MemoryMappingTree().apply { visitNamespaces("source", listOf("destination")) }
-                val mrgTree = mergeMappings(srcTree, dstTree, extTree, sharedMappingsNamespace)
-                TinyReader(mrgTree, "source", "destination").read()
-            } else {
-                val sourceMappings = TinyReader(srcTree, "named", sharedMappingsNamespace).read()
-                val destinationMappings = TinyReader(dstTree, "named", sharedMappingsNamespace).read()
-                if (mapping != null) {
-                    val legacyMap = LegacyMapping.readMappingSet(mapping.toPath(), reverseMapping)
-                    val clsMap = legacyMap.splitOffClassMappings()
-                    val srcMap = sourceMappings
-                    val dstMap = destinationMappings
-                    legacyMap.mergeBoth(
-                        // The inner clsMap is to make the join work, the outer one for custom classes (which are not part of
-                        // dstMap and would otherwise be filtered by the join)
-                        srcMap.mergeBoth(clsMap).join(dstMap.reverse()).mergeBoth(clsMap),
-                        MappingSet.create(LegacyMappingSetModelFactory()))
+                    srcTree.setIndexByDstNames(true)
+                    dstTree.setIndexByDstNames(true)
+                    val extTree = mapping?.let { file ->
+                        try {
+                            val ast = ExtraMapping.read(file.toPath())
+                            if (!reverseMapping) {
+                                ast.resolve(logger, srcTree, dstTree, "named", sharedMappingsNamespace).first
+                            } else {
+                                ast.resolve(logger, dstTree, srcTree, "named", sharedMappingsNamespace).second
+                            }
+                        } catch (e: Exception) {
+                            throw GradleException("Failed to parse $file: ${e.message}", e)
+                        }
+                    } ?: MemoryMappingTree().apply { visitNamespaces("source", listOf("destination")) }
+                    val mrgTree = mergeMappings(srcTree, dstTree, extTree, sharedMappingsNamespace)
+                    TinyReader(mrgTree, "source", "destination").read()
                 } else {
-                    val srcMap = sourceMappings!!
-                    val dstMap = destinationMappings!!
-                    srcMap.join(dstMap.reverse())
+                    val sourceMappings = TinyReader(srcTree, "named", sharedMappingsNamespace).read()
+                    val destinationMappings = TinyReader(dstTree, "named", sharedMappingsNamespace).read()
+                    if (mapping != null) {
+                        val legacyMap = LegacyMapping.readMappingSet(mapping.toPath(), reverseMapping)
+                        val clsMap = legacyMap.splitOffClassMappings()
+                        val srcMap = sourceMappings
+                        val dstMap = destinationMappings
+                        legacyMap.mergeBoth(
+                            // The inner clsMap is to make the join work, the outer one for custom classes (which are not part of
+                            // dstMap and would otherwise be filtered by the join)
+                            srcMap.mergeBoth(clsMap).join(dstMap.reverse()).mergeBoth(clsMap),
+                            MappingSet.create(LegacyMappingSetModelFactory())
+                        )
+                    } else {
+                        val srcMap = sourceMappings!!
+                        val dstMap = destinationMappings!!
+                        srcMap.join(dstMap.reverse())
+                    }
                 }
-            }
-        } else if (!intermediateMappingsName.isPresent && classpath != null && (mapping != null || sourceMappings != null && destinationMappings != null)) {
-            if (mapping != null) {
-                if (sourceMappings != null && destinationMappings != null) {
-                    val legacyMap = LegacyMapping.readMappingSet(mapping.toPath(), reverseMapping)
-                    val clsMap = legacyMap.splitOffClassMappings()
+            } else if (!intermediateMappingsName.isPresent && classpath != null && (mapping != null || sourceMappings != null && destinationMappings != null)) {
+                if (mapping != null) {
+                    if (sourceMappings != null && destinationMappings != null) {
+                        val legacyMap = LegacyMapping.readMappingSet(mapping.toPath(), reverseMapping)
+                        val clsMap = legacyMap.splitOffClassMappings()
+                        val srcMap = sourceMappings!!.readMappings()
+                        val dstMap = destinationMappings!!.readMappings()
+                        legacyMap.mergeBoth(
+                            // The inner clsMap is to make the join work, the outer one for custom classes (which are not part of
+                            // dstMap and would otherwise be filtered by the join)
+                            srcMap.mergeBoth(clsMap).join(dstMap.reverse()).mergeBoth(clsMap),
+                            MappingSet.create(LegacyMappingSetModelFactory())
+                        )
+                    } else {
+                        LegacyMapping.readMappingSet(mapping.toPath(), reverseMapping)
+                    }
+                } else {
                     val srcMap = sourceMappings!!.readMappings()
                     val dstMap = destinationMappings!!.readMappings()
-                    legacyMap.mergeBoth(
-                        // The inner clsMap is to make the join work, the outer one for custom classes (which are not part of
-                        // dstMap and would otherwise be filtered by the join)
-                        srcMap.mergeBoth(clsMap).join(dstMap.reverse()).mergeBoth(clsMap),
-                        MappingSet.create(LegacyMappingSetModelFactory())
-                    )
-                } else {
-                    LegacyMapping.readMappingSet(mapping.toPath(), reverseMapping)
+                    srcMap.join(dstMap.reverse())
                 }
             } else {
-                val srcMap = sourceMappings!!.readMappings()
-                val dstMap = destinationMappings!!.readMappings()
-                srcMap.join(dstMap.reverse())
+                null
             }
-        } else {
-            null
-        }
+
         if (mappings != null) {
             classpath!!
             val javaTransformer = Transformer(mappings, mappingsList)
@@ -289,6 +346,7 @@ open class PreprocessTask @Inject constructor(
                     null
                 }
             }?.toTypedArray()
+
             val sources = mutableMapOf<String, String>()
             val processedSources = mutableMapOf<String, String>()
             sourceFiles.forEach { (relPath, inBase, _, _) ->
@@ -320,7 +378,7 @@ open class PreprocessTask @Inject constructor(
         }
 
         fsops.delete {
-            delete(entries.map { it.generated })
+            delete(sourceFiles.map { it.outBase })
         }
 
         val commentPreprocessor = CommentPreprocessor(vars.get())
@@ -338,7 +396,12 @@ open class PreprocessTask @Inject constructor(
                         for ((line, error) in errors) {
                             errorsByLine.getOrPut(line, ::mutableListOf).add(error)
                         }
-                        source.lines().mapIndexed { index: Int, line: String -> Pair(line, errorsByLine[index] ?: emptyList<String>()) }
+                        source.lines().mapIndexed { index: Int, line: String ->
+                            Pair(
+                                line,
+                                errorsByLine[index] ?: emptyList<String>()
+                            )
+                        }
                     } ?: lines.map { Pair(it, emptyList()) }
                 }
                 commentPreprocessor.convertFile(kws.value, file, outFile, javaTransform)
@@ -527,9 +590,11 @@ open class PreprocessTask @Inject constructor(
                 val srcName = extField.getName(extSrcNsId)
                 val srcDesc = extField.getDesc(extSrcNsId)
                 if (srcDesc == null) {
-                    logger.error("Owner ${extCls.getName(extSrcNsId)} of field $srcName does not appear to have any mappings. " +
-                        "As such, you must provide the full signature of this method manually " +
-                        "(if it does not change across versions, providing it for either version is sufficient).")
+                    logger.error(
+                        "Owner ${extCls.getName(extSrcNsId)} of field $srcName does not appear to have any mappings. " +
+                                "As such, you must provide the full signature of this method manually " +
+                                "(if it does not change across versions, providing it for either version is sufficient)."
+                    )
                     continue
                 }
                 mrgTree.visitField(srcName, srcDesc)
@@ -539,9 +604,11 @@ open class PreprocessTask @Inject constructor(
                 val srcName = extMethod.getName(extSrcNsId)
                 val srcDesc = extMethod.getDesc(extSrcNsId)
                 if (srcDesc == null) {
-                    logger.error("Owner ${extCls.getName(extSrcNsId)} of method $srcName does not appear to have any mappings. " +
-                        "As such, you must provide the full signature of this method manually " +
-                        "(if it does not change across versions, providing it for either version is sufficient).")
+                    logger.error(
+                        "Owner ${extCls.getName(extSrcNsId)} of method $srcName does not appear to have any mappings. " +
+                                "As such, you must provide the full signature of this method manually " +
+                                "(if it does not change across versions, providing it for either version is sufficient)."
+                    )
                     continue
                 }
                 mrgTree.visitMethod(srcName, srcDesc)
@@ -564,30 +631,34 @@ open class PreprocessTask @Inject constructor(
             mrgTree.visitClass(srcCls.getName(srcNamedNsId))
             mrgTree.visitDstName(MappedElementKind.CLASS, 0, dstCls.getName(dstNamedNsId))
             for (srcField in srcCls.fields) {
-                val extField = extCls?.getField(srcField.getName(srcNamedNsId), srcField.getDesc(srcNamedNsId), extSrcNsId)
+                val extField =
+                    extCls?.getField(srcField.getName(srcNamedNsId), srcField.getDesc(srcNamedNsId), extSrcNsId)
                 if (extField != null) {
                     extCls.removeField(extField.srcName, extField.srcDesc)
                     mrgTree.visitField(srcField.getName(srcNamedNsId), srcField.getDesc(srcNamedNsId))
                     mrgTree.visitDstName(MappedElementKind.FIELD, 0, extField.getName(extDstNsId))
                     continue
                 }
-                val dstField = dstCls.getField(srcField.getName(srcSharedNsId), srcField.getDesc(srcSharedNsId), dstSharedNsId)
-                    ?: dstCls.getField(srcField.getName(srcSharedNsId), null, dstSharedNsId)
-                    ?: continue
+                val dstField =
+                    dstCls.getField(srcField.getName(srcSharedNsId), srcField.getDesc(srcSharedNsId), dstSharedNsId)
+                        ?: dstCls.getField(srcField.getName(srcSharedNsId), null, dstSharedNsId)
+                        ?: continue
                 mrgTree.visitField(srcField.getName(srcNamedNsId), srcField.getDesc(srcNamedNsId))
                 mrgTree.visitDstName(MappedElementKind.FIELD, 0, dstField.getName(dstNamedNsId))
             }
             for (srcMethod in srcCls.methods) {
-                val extMethod = extCls?.getMethod(srcMethod.getName(srcNamedNsId), srcMethod.getDesc(srcNamedNsId), extSrcNsId)
+                val extMethod =
+                    extCls?.getMethod(srcMethod.getName(srcNamedNsId), srcMethod.getDesc(srcNamedNsId), extSrcNsId)
                 if (extMethod != null) {
                     extCls.removeMethod(extMethod.srcName, extMethod.srcDesc)
                     mrgTree.visitMethod(srcMethod.getName(srcNamedNsId), srcMethod.getDesc(srcNamedNsId))
                     mrgTree.visitDstName(MappedElementKind.METHOD, 0, extMethod.getName(extDstNsId))
                     continue
                 }
-                val dstMethod = dstCls.getMethod(srcMethod.getName(srcSharedNsId), srcMethod.getDesc(srcSharedNsId), dstSharedNsId)
-                    ?: dstCls.getMethod(srcMethod.getName(srcSharedNsId), null, dstSharedNsId)
-                    ?: continue
+                val dstMethod =
+                    dstCls.getMethod(srcMethod.getName(srcSharedNsId), srcMethod.getDesc(srcSharedNsId), dstSharedNsId)
+                        ?: dstCls.getMethod(srcMethod.getName(srcSharedNsId), null, dstSharedNsId)
+                        ?: continue
                 mrgTree.visitMethod(srcMethod.getName(srcNamedNsId), srcMethod.getDesc(srcNamedNsId))
                 mrgTree.visitDstName(MappedElementKind.METHOD, 0, dstMethod.getName(dstNamedNsId))
             }
@@ -616,7 +687,8 @@ class CommentPreprocessor(
     var fail = false
 
     private fun String.evalVarOrNull() = cleanUpIfVersion().toIntOrNull() ?: vars[this]
-    private fun String.evalVar() = cleanUpIfVersion().evalVarOrNull() ?: throw NoSuchElementException("\'$this\' is not in $vars")
+    private fun String.evalVar() =
+        cleanUpIfVersion().evalVarOrNull() ?: throw NoSuchElementException("\'$this\' is not in $vars")
 
     private fun String.cleanUpIfVersion(): String {
         // Verify that this could be a version
@@ -677,7 +749,12 @@ class CommentPreprocessor(
     private val String.indentation: Int
         get() = takeWhile { it == ' ' }.length
 
-    fun convertSource(kws: Keywords, lines: List<String>, remapped: List<Pair<String, List<String>>>, fileName: String): List<String> {
+    fun convertSource(
+        kws: Keywords,
+        lines: List<String>,
+        remapped: List<Pair<String, List<String>>>,
+        fileName: String
+    ): List<String> {
         val stack = mutableListOf<IfStackEntry>()
         val indentStack = mutableListOf<Int>()
         var active = true
@@ -810,7 +887,12 @@ class CommentPreprocessor(
         }
     }
 
-    fun convertFile(kws: Keywords, inFile: File, outFile: File, remap: ((List<String>) -> List<Pair<String, List<String>>>)? = null) {
+    fun convertFile(
+        kws: Keywords,
+        inFile: File,
+        outFile: File,
+        remap: ((List<String>) -> List<Pair<String, List<String>>>)? = null
+    ) {
         val string = inFile.readText()
         var lines = string.lines()
         val remapped = remap?.invoke(lines) ?: lines.map { Pair(it, emptyList()) }

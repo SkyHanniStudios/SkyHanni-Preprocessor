@@ -35,7 +35,7 @@ abstract class CleanupUnnecessaryMappingsTask : DefaultTask() {
             }
             tmpInOuts.forEach { it.generated.deleteRecursively() }
 
-            task.preprocess(tmpMappingsFile, tmpInOuts)
+            task.preprocessAll(tmpMappingsFile, tmpInOuts)
 
             var changed = false
             for ((i, inOut) in task.entries.withIndex()) {
