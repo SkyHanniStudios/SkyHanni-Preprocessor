@@ -17,7 +17,6 @@ import org.gradle.api.file.FileSystemOperations
 import org.gradle.api.file.ProjectLayout
 import org.gradle.api.model.ObjectFactory
 import org.gradle.api.tasks.CacheableTask
-import org.gradle.api.tasks.CompileClasspath
 import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.InputDirectory
 import org.gradle.api.tasks.InputFile
@@ -44,6 +43,8 @@ import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.regex.Pattern
 import javax.inject.Inject
+import kotlin.io.path.extension
+import kotlin.io.path.isDirectory
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.pathString
 import kotlin.io.path.readLines
@@ -59,6 +60,8 @@ data class Keywords(
     val endif: String,
     val eval: String,
 ) : Serializable
+
+private val pathDelimiter = Paths.get("\\").pathString
 
 @CacheableTask
 open class PreprocessTask @Inject constructor(
@@ -156,14 +159,10 @@ open class PreprocessTask @Inject constructor(
     @PathSensitive(PathSensitivity.RELATIVE)
     val remappedjdkHome = objects.directoryProperty()
 
-    @InputFiles
-    @Optional
-    @CompileClasspath
+    @Internal   // These are Inputs, but they will be handled with the source changes anyway
     var classpath: FileCollection? = null
 
-    @InputFiles
-    @Optional
-    @CompileClasspath
+    @Internal   // These are Inputs, but they will be handled with the source changes anyway
     var remappedClasspath: FileCollection? = null
 
     @Input
@@ -183,6 +182,9 @@ open class PreprocessTask @Inject constructor(
     @Input
     val projectNaming = "at.hannibal2.skyhanni" //TODO do not hardcode
 
+    @Input
+    val incrementalFlag = true //TODO set default false
+
     fun entry(source: FileCollection, generated: File, overwrites: File) {
         entries.add(InOut(source, generated, overwrites))
         sourceFiles.from(source)
@@ -192,7 +194,7 @@ open class PreprocessTask @Inject constructor(
     @TaskAction
     fun preprocess(inputChanges: InputChanges) {
 
-        if (!inputChanges.isIncremental) {
+        if (!inputChanges.isIncremental || !incrementalFlag) {
             logger.lifecycle("Full Preprocess run")
             preprocessAll(mapping, entries)
             return
@@ -231,7 +233,9 @@ open class PreprocessTask @Inject constructor(
 
         logger.debug("sourceFiles: {}", sourceFiles)
 
-        val dependencies = mutableMapOf<String, Entry>()
+        val dependencies = mutableListOf<Entry>()
+
+        val solvedDependencies = sourceFiles.map { it.resolveOut }.toMutableSet()
 
         val walkDownCache = mutableMapOf<Path, String>()
 
@@ -240,23 +244,23 @@ open class PreprocessTask @Inject constructor(
         for (entry in sourceFiles) {
             if (!entry.isJavaOrKotlin) continue
 
-            val walkDown = walkDownCache.computeIfAbsent(entry.sourceBase) { path ->
+            val walkDown = walkDownCache.computeIfAbsent(entry.outBase) { path ->
 
                 Files.walk(path).filter { Files.isDirectory(it) }.filter { it.endsWith(convertedCompanyName) }
                     .findFirst().orElse(null)?.let {
-                        path.relativize(it).pathString + Paths.get("\\").pathString
+                        path.relativize(it).pathString + pathDelimiter
                     } ?: run {
-                    logger.error("Failed to find walkDown of '$convertedCompanyName' in entry '${entry.sourceBase}'")
+                    logger.error("Failed to find walkDown of '$convertedCompanyName' in entry '${entry.outBase}'")
                     ""
                 }
             }
-            cascadingDependencyResolution(walkDown, entry, dependencies)
+            cascadingDependencyResolution(walkDown, entry, solvedDependencies, dependencies)
         }
 
-        logger.debug("dependencies: {}", dependencies.values)
+        logger.debug("dependencies: {}", dependencies)
         logger.lifecycle("Touching ${sourceFiles.size + dependencies.size} files")
 
-        preprocess(mapping, sourceFiles, dependencies.values)
+        preprocess(mapping, sourceFiles, dependencies)
     }
 
     private fun String.convertedDotToPath(): String = Paths.get(replace('.', '\\')).pathString
@@ -291,7 +295,7 @@ open class PreprocessTask @Inject constructor(
 
     private data class Entry(
         val relPath: String,
-        private val inBase: Path?,
+        val inBase: Path?,
         val outBase: Path,
         private val overwritesBase: Path?,
     ) {
@@ -313,26 +317,71 @@ open class PreprocessTask @Inject constructor(
 
         val resolvedSource: Path = sourceBase.resolve(relPath)
 
-        fun getEntryForDependedFile(fileLocation: String): Entry? {
-            val relative =
-                resolveDependedFile(overwritesBase, fileLocation) ?: resolveDependedFile(inBase, fileLocation)
-                ?: return null
-            return Entry(relative.pathString, inBase, outBase, overwritesBase)
+        val resolvedFuture: Path = if (resolveOut.isRegularFile()) resolveOut else resolveOverwrite ?: resolveBase!!
+
+        fun makeCopy(relativePath: String) = Entry(relativePath, inBase, outBase, overwritesBase)
+        fun makeCopyAbsoluteBase(absolutePath: Path) = makeCopy(inBase!!.relativize(absolutePath).pathString)
+        fun makeCopyAbsoluteOut(absolutePath: Path) = makeCopy(outBase.relativize(absolutePath).pathString)
+
+        fun findFirstDirOrFileUnderOut(prefix: String, fileLocation: String): Path {
+            val combi = Paths.get(prefix, fileLocation)
+            val baseResolved = outBase.resolve(combi)
+            if (baseResolved.isDirectory()) {
+                return baseResolved
+            }
+            return listOf(".kt", ".java").map {
+                outBase.resolve(combi.pathString + it)
+            }.firstOrNull { it.isRegularFile() }
+                ?: findFirstDirOrFileUnderOut(prefix, fileLocation.substringBeforeLast(pathDelimiter, ""))
         }
+    }
 
-        @JvmName("resolveDependedFileNullable")
-        private fun resolveDependedFile(inBase: Path?, fileLocation: String): Path? =
-            if (inBase == null) null else resolveDependedFile(inBase, fileLocation)
+    private val normalProjectImport = "import $projectNaming"
+    private val commentedProjectImport = "//$$ import $projectNaming"
 
-        private fun resolveDependedFile(inBase: Path, fileLocation: String): Path? {
-            if (fileLocation.isEmpty()) return null
-            val result = listOf(".kt", ".java").map {
-                inBase.resolve(fileLocation + it)
-            }.firstOrNull { it.isRegularFile() } ?: resolveDependedFile(
-                inBase,
-                fileLocation.substringBeforeLast('.', "")
-            ) ?: return null
-            return inBase.relativize(result)
+    private fun String.resolveImport(): String? = when {
+        startsWith(normalProjectImport) -> removeImportAliases(normalProjectImport.length + 1)
+        startsWith(commentedProjectImport) -> removeImportAliases(commentedProjectImport.length + 1)
+        else -> null
+    }
+
+    private fun String.removeImportAliases(prefixCount: Int): String {
+        val end = indexOf(" as ", prefixCount)
+        return if (end == -1) substring(prefixCount).trim() else substring(prefixCount, end).trim()
+    }
+
+    private fun cascadingDependencyResolution(
+        prefix: String,
+        entry: Entry,
+        solved: MutableSet<Path>,
+        result: MutableList<Entry>,
+        useFuture: Boolean = false,
+    ) {
+        val lines = (if (useFuture) entry.resolvedFuture else entry.resolvedSource).readLines()
+
+        for (line in lines) {
+            val import = line.resolveImport()?.convertedDotToPath() ?: continue
+            val dependency = entry.findFirstDirOrFileUnderOut(prefix, import)
+
+            if (solved.contains(dependency)) continue
+
+            if (dependency.isDirectory()) {
+                val subFiles =
+                    Files.newDirectoryStream(dependency) { it.isRegularFile() && (it.extension == "java" || it.extension == "kt") }
+                        .toList()
+                solved.add(dependency)
+                solved.addAll(subFiles)
+                val newEntries = subFiles.map { entry.makeCopyAbsoluteOut(it) }
+                result.addAll(newEntries)
+                newEntries.forEach {
+                    cascadingDependencyResolution(prefix, it, solved, result, true)
+                }
+            } else {
+                solved.add(dependency)
+                val newEntry = entry.makeCopyAbsoluteOut(dependency)
+                result.add(newEntry)
+                cascadingDependencyResolution(prefix, newEntry, solved, result, true)
+            }
         }
     }
 
@@ -340,30 +389,6 @@ open class PreprocessTask @Inject constructor(
         val filePath: Path = file.toPath().normalize()
         val rootPath: Path = this.toPath().normalize()
         return filePath.startsWith(rootPath)
-    }
-
-    private val normalProjectImport = "import $projectNaming"
-    private val commentedProjectImport = "//$$ import $projectNaming"
-
-    private fun String.resolveImport(): String? = when {
-        startsWith(normalProjectImport) -> substring(normalProjectImport.length).trim()
-        startsWith(commentedProjectImport) -> substring(commentedProjectImport.length).trim()
-        else -> null
-    }
-
-    private fun cascadingDependencyResolution(prefix: String, entry: Entry, solved: MutableMap<String, Entry>) {
-        val lines = entry.resolvedSource.readLines()
-
-        for (line in lines) {
-            val dependency = line.resolveImport() ?: continue
-            if (solved.contains(dependency)) continue
-            val fileLocation = prefix + dependency.convertedDotToPath()
-
-            val newEntry = entry.getEntryForDependedFile(fileLocation) ?: continue
-
-            solved[dependency] = newEntry
-            cascadingDependencyResolution(prefix, newEntry, solved)
-        }
     }
 
     private fun preprocess(mapping: File?, sourceFiles: List<Entry>, alreadyProcessedFiles: Collection<Entry>) {
