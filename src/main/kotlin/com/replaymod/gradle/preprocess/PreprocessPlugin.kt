@@ -70,6 +70,9 @@ class PreprocessPlugin : Plugin<Project> {
             return
         }
 
+        // Default false
+        val incremental = project.findProperty("skyhanni.preprocessor.incremental")?.toString()?.toBoolean() == true
+
         project.evaluationDependsOn(parent.path)
         val rootExtension = parent.extensions.getByType<RootPreprocessExtension>()
         val graph = rootExtension.rootNode ?: throw IllegalStateException("Preprocess graph was not configured.")
@@ -104,6 +107,11 @@ class PreprocessPlugin : Plugin<Project> {
             val reverseMappings = (inheritedLink != null) != mappingFileInverted
             val inherited = parent.evaluationDependsOn(inheritedNode.project)
 
+            project.afterEvaluate {
+                project.tasks.withType<PreprocessTask>().configureEach {
+                    projectNaming = project.group.toString()
+                }
+            }
             project.the<SourceSetContainer>().configureEach {
                 val inheritedSourceSet = inherited.the<SourceSetContainer>()[name]
                 val cName = if (name == "main") "" else name.uppercaseFirstChar()
@@ -148,6 +156,7 @@ class PreprocessPlugin : Plugin<Project> {
                     keywords.convention(ext.keywords)
                     patternAnnotation.convention(ext.patternAnnotation)
                     manageImports.convention(ext.manageImports)
+                    incrementalFlag = incremental
                 }
                 val sourceJavaTask = project.tasks.findByName("source${name.uppercaseFirstChar()}Java")
                 (sourceJavaTask ?: project.tasks["compile${cName}Java"]).dependsOn(preprocessCode)

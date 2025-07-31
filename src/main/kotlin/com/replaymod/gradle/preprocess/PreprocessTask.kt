@@ -180,10 +180,18 @@ open class PreprocessTask @Inject constructor(
     val manageImports = objects.property<Boolean>()
 
     @Input
-    val projectNaming = "at.hannibal2.skyhanni" //TODO do not hardcode
+    var incrementalFlag = false
 
     @Input
-    val incrementalFlag = true //TODO set default false
+    var projectNaming = ""
+        set(value) {
+            normalProjectImport = "import $value"
+            commentedProjectImport = "//$$ import $value"
+            field = value
+        }
+
+    private var normalProjectImport = "import $projectNaming"
+    private var commentedProjectImport = "//$$ import $projectNaming"
 
     fun entry(source: FileCollection, generated: File, overwrites: File) {
         entries.add(InOut(source, generated, overwrites))
@@ -335,9 +343,6 @@ open class PreprocessTask @Inject constructor(
                 ?: findFirstDirOrFileUnderOut(prefix, fileLocation.substringBeforeLast(pathDelimiter, ""))
         }
     }
-
-    private val normalProjectImport = "import $projectNaming"
-    private val commentedProjectImport = "//$$ import $projectNaming"
 
     private fun String.resolveImport(): String? = when {
         startsWith(normalProjectImport) -> removeImportAliases(normalProjectImport.length + 1)
