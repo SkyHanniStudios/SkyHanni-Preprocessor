@@ -23,7 +23,7 @@ plugins {
 }
 
 group = "com.github.SkyHanniStudios"
-version = "0.8.1"
+version = "1.0.0"
 val githubProjectName = "SkyHanni-Preprocessor"
 
 kotlin {
@@ -50,7 +50,7 @@ repositories {
 dependencies {
     implementation(gradleApi())
     implementation(localGroovy())
-    implementation("com.github.SkyHanniStudios:SkyHanni-Remap:b50001e883")
+    implementation("com.github.SkyHanniStudios:skyhanni-remap:1.0.0")
     implementation("net.fabricmc:mapping-io:0.6.1")
     testImplementation("io.kotest:kotest-runner-junit5-jvm:$kotestVersion")
     testImplementation("io.kotest:kotest-assertions-core-jvm:$kotestVersion")

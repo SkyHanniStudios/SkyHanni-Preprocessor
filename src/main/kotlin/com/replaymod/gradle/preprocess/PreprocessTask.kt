@@ -11,14 +11,27 @@ import net.fabricmc.mappingio.tree.MemoryMappingTree
 import org.cadixdev.lorenz.MappingSet
 import org.gradle.api.DefaultTask
 import org.gradle.api.GradleException
+import org.gradle.api.file.ConfigurableFileCollection
 import org.gradle.api.file.FileCollection
 import org.gradle.api.file.FileSystemOperations
-import org.gradle.api.file.FileTree
 import org.gradle.api.file.ProjectLayout
 import org.gradle.api.model.ObjectFactory
-import org.gradle.api.tasks.*
+import org.gradle.api.tasks.CacheableTask
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.InputFile
+import org.gradle.api.tasks.InputFiles
+import org.gradle.api.tasks.Internal
+import org.gradle.api.tasks.Optional
+import org.gradle.api.tasks.OutputDirectories
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
+import org.gradle.api.tasks.TaskAction
 import org.gradle.kotlin.dsl.mapProperty
 import org.gradle.kotlin.dsl.property
+import org.gradle.work.ChangeType
+import org.gradle.work.Incremental
+import org.gradle.work.InputChanges
 import org.jetbrains.kotlin.backend.common.peek
 import org.jetbrains.kotlin.backend.common.pop
 import org.jetbrains.kotlin.backend.common.push
@@ -27,8 +40,15 @@ import java.io.File
 import java.io.Serializable
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
 import java.util.regex.Pattern
 import javax.inject.Inject
+import kotlin.io.path.extension
+import kotlin.io.path.isDirectory
+import kotlin.io.path.isRegularFile
+import kotlin.io.path.pathString
+import kotlin.io.path.readLines
+import kotlin.io.path.readText
 
 data class Keywords(
     val disableRemap: String,
@@ -38,14 +58,16 @@ data class Keywords(
     val elseif: String,
     val `else`: String,
     val endif: String,
-    val eval: String
+    val eval: String,
 ) : Serializable
+
+private val pathDelimiter = Paths.get("\\").pathString
 
 @CacheableTask
 open class PreprocessTask @Inject constructor(
     private val layout: ProjectLayout,
     private val fsops: FileSystemOperations,
-    objects: ObjectFactory
+    objects: ObjectFactory,
 ) : DefaultTask() {
     companion object {
         @JvmStatic
@@ -84,24 +106,18 @@ open class PreprocessTask @Inject constructor(
     @Internal
     var entries: MutableList<InOut> = mutableListOf()
 
-    @InputFiles
-    @SkipWhenEmpty
-    @PathSensitive(PathSensitivity.RELATIVE)
-    fun getSourceFileTrees(): List<FileTree> {
-        return entries.flatMap { it.source }.map { layout.files(it).asFileTree }
-    }
+    @get:Incremental
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    val sourceFiles: ConfigurableFileCollection = objects.fileCollection()
 
-    @InputFiles
-    @Optional
-    @PathSensitive(PathSensitivity.RELATIVE)
-    fun getOverwritesFileTrees(): List<FileTree> {
-        return entries.mapNotNull { it.overwrites?.let { layout.files(it).asFileTree } }
-    }
+    @get:Incremental
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    val overwriteFiles: ConfigurableFileCollection = objects.fileCollection()
 
     @OutputDirectories
-    fun getGeneratedDirectories(): List<File> {
-        return entries.map { it.generated }
-    }
+    fun getGeneratedDirectories(): List<File> = entries.map { it.generated }
 
     @InputFile
     @Optional
@@ -143,14 +159,10 @@ open class PreprocessTask @Inject constructor(
     @PathSensitive(PathSensitivity.RELATIVE)
     val remappedjdkHome = objects.directoryProperty()
 
-    @InputFiles
-    @Optional
-    @CompileClasspath
+    @Internal   // These are Inputs, but they will be handled with the source changes anyway
     var classpath: FileCollection? = null
 
-    @InputFiles
-    @Optional
-    @CompileClasspath
+    @Internal   // These are Inputs, but they will be handled with the source changes anyway
     var remappedClasspath: FileCollection? = null
 
     @Input
@@ -167,28 +179,227 @@ open class PreprocessTask @Inject constructor(
     @Optional
     val manageImports = objects.property<Boolean>()
 
+    @Input
+    var incrementalFlag = false
+
+    @Input
+    var projectNaming = ""
+        set(value) {
+            normalProjectImport = "import $value"
+            commentedProjectImport = "//$$ import $value"
+            field = value
+        }
+
+    private var normalProjectImport = "import $projectNaming"
+    private var commentedProjectImport = "//$$ import $projectNaming"
+
     fun entry(source: FileCollection, generated: File, overwrites: File) {
         entries.add(InOut(source, generated, overwrites))
+        sourceFiles.from(source)
+        overwriteFiles.from(overwrites)
     }
 
     @TaskAction
-    fun preprocess() {
-        preprocess(mapping, entries)
+    fun preprocess(inputChanges: InputChanges) {
+
+        if (!inputChanges.isIncremental || !incrementalFlag) {
+            logger.lifecycle("Full Preprocess run")
+            preprocessAll(mapping, entries)
+            return
+        }
+
+        val sourceChanges = inputChanges.getFileChanges(sourceFiles).associate { it.file to it.changeType }
+        val overwriteChanges = inputChanges.getFileChanges(overwriteFiles).associate { it.file to it.changeType }
+        val changedFiles = sourceChanges + overwriteChanges
+        logger.lifecycle("Incremental Preprocess run with ${changedFiles.size} changes")
+
+        val sourceFiles: List<Entry> = changedFiles.flatMap { (file, change) ->
+            val (inOut, inBase) = entries.firstNotNullOfOrNull { entry ->
+                entry.source.files.find { it.isContained(file) }?.let { entry to it }
+                    ?: entry.overwrites?.isContained(file)?.let { entry to null }
+            } ?: return@flatMap emptyList()
+
+            val outBasePath = inOut.generated.toPath()
+            val overwritesBasePath = inOut.overwrites?.toPath()
+            val inBasePath = inBase?.toPath()
+
+            val sourcePath = inBasePath ?: overwritesBasePath ?: return@flatMap emptyList()
+
+            if (change == ChangeType.REMOVED) {
+                fsops.delete {
+                    delete(outBasePath.resolve(sourcePath.relativize(file.toPath())))
+                }
+                return@flatMap emptyList()
+            }
+
+            layout.files(file).asFileTree.map { f ->
+                val relPath = sourcePath.relativize(f.toPath())
+                Entry(relPath.toString(), inBasePath, outBasePath, overwritesBasePath)
+            }
+
+        }
+
+        logger.debug("sourceFiles: {}", sourceFiles)
+
+        val dependencies = mutableListOf<Entry>()
+
+        val solvedDependencies = sourceFiles.map { it.resolveOut }.toMutableSet()
+
+        val walkDownCache = mutableMapOf<Path, String>()
+
+        val convertedCompanyName = projectNaming.convertedDotToPath()
+
+        for (entry in sourceFiles) {
+            if (!entry.isJavaOrKotlin) continue
+
+            val walkDown = walkDownCache.computeIfAbsent(entry.outBase) { path ->
+
+                Files.walk(path).filter { Files.isDirectory(it) }.filter { it.endsWith(convertedCompanyName) }
+                    .findFirst().orElse(null)?.let {
+                        path.relativize(it).pathString + pathDelimiter
+                    } ?: run {
+                    logger.error("Failed to find walkDown of '$convertedCompanyName' in entry '${entry.outBase}'")
+                    ""
+                }
+            }
+            cascadingDependencyResolution(walkDown, entry, solvedDependencies, dependencies)
+        }
+
+        logger.debug("dependencies: {}", dependencies)
+        logger.lifecycle("Touching ${sourceFiles.size + dependencies.size} files")
+
+        preprocess(mapping, sourceFiles, dependencies)
     }
 
-    fun preprocess(mapping: File?, entries: List<InOut>) {
-        data class Entry(val relPath: String, val inBase: Path, val outBase: Path, val overwritesBase: Path?)
+    private fun String.convertedDotToPath(): String = Paths.get(replace('.', '\\')).pathString
 
-        val sourceFiles: List<Entry> = entries.flatMap { inOut ->
+    fun preprocessAll(mapping: File?, entries: List<InOut>) {
+
+        val sourceFiles = entries.flatMap { inOut ->
             val outBasePath = inOut.generated.toPath()
             val overwritesBasePath = inOut.overwrites?.toPath()
             inOut.source.flatMap { inBase ->
                 val inBasePath = inBase.toPath()
                 layout.files(inBase).asFileTree.map { file ->
                     val relPath = inBasePath.relativize(file.toPath())
-                    Entry(relPath.toString(), inBasePath, outBasePath, overwritesBasePath)
+                    Entry(relPath.pathString, inBasePath, outBasePath, overwritesBasePath)
                 }
             }
+        }
+
+        val onlyOverwrite = entries.filter { inOut -> inOut.overwrites != null }.flatMap { inOut ->
+            val base = inOut.overwrites!!
+            if (inOut.source.files.any { it.isContained(base) }) return@flatMap emptyList()
+            layout.files(base).asFileTree.mapNotNull { file ->
+                if (file.name.endsWith(".java") || file.name.endsWith(".kt")) {
+                    val relPath = base.toPath().relativize(file.toPath())
+                    Entry(relPath.pathString, inOut.source.first().toPath(), inOut.generated.toPath(), base.toPath())
+                } else null
+            }
+        }
+
+        preprocess(mapping, sourceFiles + onlyOverwrite, emptyList())
+    }
+
+    private data class Entry(
+        val relPath: String,
+        val inBase: Path?,
+        val outBase: Path,
+        private val overwritesBase: Path?,
+    ) {
+
+        init {
+            require(inBase != null || overwritesBase != null) {
+                "Entry without any source file"
+            }
+        }
+
+        val resolveBase: Path? = inBase?.resolve(relPath)
+        val resolveOut: Path = outBase.resolve(relPath)
+        val resolveOverwrite: Path? = overwritesBase?.resolve(relPath)
+        val isJavaOrKotlin = relPath.endsWith(".java") || relPath.endsWith(".kt")
+        val hasOverwrite = resolveOverwrite?.isRegularFile() == true
+        val hasBase = resolveBase?.isRegularFile() == true
+
+        val sourceBase: Path = (if (hasOverwrite) overwritesBase else inBase)!!
+
+        val resolvedSource: Path = sourceBase.resolve(relPath)
+
+        val resolvedFuture: Path = if (resolveOut.isRegularFile()) resolveOut else resolveOverwrite ?: resolveBase!!
+
+        fun makeCopy(relativePath: String) = Entry(relativePath, inBase, outBase, overwritesBase)
+        fun makeCopyAbsoluteBase(absolutePath: Path) = makeCopy(inBase!!.relativize(absolutePath).pathString)
+        fun makeCopyAbsoluteOut(absolutePath: Path) = makeCopy(outBase.relativize(absolutePath).pathString)
+
+        fun findFirstDirOrFileUnderOut(prefix: String, fileLocation: String): Path {
+            val combi = Paths.get(prefix, fileLocation)
+            val baseResolved = outBase.resolve(combi)
+            if (baseResolved.isDirectory()) {
+                return baseResolved
+            }
+            return listOf(".kt", ".java").map {
+                outBase.resolve(combi.pathString + it)
+            }.firstOrNull { it.isRegularFile() }
+                ?: findFirstDirOrFileUnderOut(prefix, fileLocation.substringBeforeLast(pathDelimiter, ""))
+        }
+    }
+
+    private fun String.resolveImport(): String? = when {
+        startsWith(normalProjectImport) -> removeImportAliases(normalProjectImport.length + 1)
+        startsWith(commentedProjectImport) -> removeImportAliases(commentedProjectImport.length + 1)
+        else -> null
+    }
+
+    private fun String.removeImportAliases(prefixCount: Int): String {
+        val end = indexOf(" as ", prefixCount)
+        return if (end == -1) substring(prefixCount).trim() else substring(prefixCount, end).trim()
+    }
+
+    private fun cascadingDependencyResolution(
+        prefix: String,
+        entry: Entry,
+        solved: MutableSet<Path>,
+        result: MutableList<Entry>,
+        useFuture: Boolean = false,
+    ) {
+        val lines = (if (useFuture) entry.resolvedFuture else entry.resolvedSource).readLines()
+
+        for (line in lines) {
+            val import = line.resolveImport()?.convertedDotToPath() ?: continue
+            val dependency = entry.findFirstDirOrFileUnderOut(prefix, import)
+
+            if (solved.contains(dependency)) continue
+
+            if (dependency.isDirectory()) {
+                val subFiles =
+                    Files.newDirectoryStream(dependency) { it.isRegularFile() && (it.extension == "java" || it.extension == "kt") }
+                        .toList()
+                solved.add(dependency)
+                solved.addAll(subFiles)
+                val newEntries = subFiles.map { entry.makeCopyAbsoluteOut(it) }
+                result.addAll(newEntries)
+                newEntries.forEach {
+                    cascadingDependencyResolution(prefix, it, solved, result, true)
+                }
+            } else {
+                solved.add(dependency)
+                val newEntry = entry.makeCopyAbsoluteOut(dependency)
+                result.add(newEntry)
+                cascadingDependencyResolution(prefix, newEntry, solved, result, true)
+            }
+        }
+    }
+
+    private fun File.isContained(file: File): Boolean {
+        val filePath: Path = file.toPath().normalize()
+        val rootPath: Path = this.toPath().normalize()
+        return filePath.startsWith(rootPath)
+    }
+
+    private fun preprocess(mapping: File?, sourceFiles: List<Entry>, alreadyProcessedFiles: Collection<Entry>) {
+
+        fsops.delete {
+            delete(sourceFiles.map(Entry::resolveOut))
         }
 
         var mappedSources: Map<String, Pair<String, List<Pair<Int, String>>>>? = null
@@ -196,7 +407,107 @@ open class PreprocessTask @Inject constructor(
         val classpath = classpath
         val sourceMappingsFile = sourceMappings
         val destinationMappingsFile = destinationMappings
-        val mappings = if (intermediateMappingsName.isPresent && classpath != null && sourceMappingsFile != null && destinationMappingsFile != null) {
+        val mappings = makeMappings(classpath, sourceMappingsFile, destinationMappingsFile, mapping)
+
+        if (mappings != null) {
+            classpath!!
+            val javaTransformer = Transformer(mappings, mappingsList)
+            javaTransformer.verboseCompilerMessages = logger.isInfoEnabled
+            javaTransformer.patternAnnotation = patternAnnotation.orNull
+            javaTransformer.manageImports = manageImports.getOrElse(false)
+            javaTransformer.jdkHome = jdkHome.orNull?.asFile
+            javaTransformer.remappedJdkHome = remappedjdkHome.orNull?.asFile
+            LOGGER.debug("Remap Classpath:")
+            javaTransformer.classpath = classpath.files.mapNotNull {
+                if (it.exists()) {
+                    it.absolutePath.also(LOGGER::debug)
+                } else {
+                    LOGGER.debug("{} (file does not exist)", it)
+                    null
+                }
+            }.toTypedArray()
+            LOGGER.debug("Remapped Classpath:")
+            javaTransformer.remappedClasspath = remappedClasspath?.files?.mapNotNull {
+                if (it.exists()) {
+                    it.absolutePath.also(LOGGER::debug)
+                } else {
+                    LOGGER.debug("{} (file does not exist)", it)
+                    null
+                }
+            }?.toTypedArray()
+
+            val sources = mutableMapOf<String, String>()
+            val processedSources = mutableMapOf<String, String>()
+            for (entry in sourceFiles) {
+                if (!entry.isJavaOrKotlin || !entry.hasBase) continue
+                val text = String(Files.readAllBytes(entry.resolveBase!!))
+                sources[entry.relPath] = text
+                val lines = text.lines()
+                val kws = keywords.get().entries.find { (ext, _) -> entry.relPath.endsWith(ext) }
+                if (kws != null) {
+                    processedSources[entry.relPath] = CommentPreprocessor(vars.get()).convertSource(
+                        kws.value,
+                        lines,
+                        lines.map { Pair(it, emptyList()) },
+                        entry.relPath
+                    ).joinToString("\n")
+                }
+            }
+
+            for (entry in sourceFiles) {
+                if (!entry.isJavaOrKotlin || !entry.hasOverwrite) continue
+                processedSources[entry.relPath.toString()] = entry.resolveOverwrite?.readText() ?: continue
+            }
+
+            val reference = alreadyProcessedFiles.filter { it.isJavaOrKotlin && it.hasBase }
+                .associate { it.relPath.toString() to it.resolveBase!!.readText() }
+
+            mappedSources = javaTransformer.remap(sources, reference, processedSources)
+        }
+
+        val commentPreprocessor = CommentPreprocessor(vars.get())
+        sourceFiles.forEach { entry ->
+            if (entry.hasOverwrite) return@forEach
+            val relPath = entry.relPath
+            val file = entry.resolveBase?.toFile() ?: return@forEach
+            val outFile = entry.resolveOut.toFile()
+            val kws = keywords.get().entries.find { (ext, _) -> file.name.endsWith(ext) }
+            if (kws != null) {
+                val javaTransform = { lines: List<String> ->
+                    mappedSources?.get(relPath)?.let { (source, errors) ->
+                        val errorsByLine = mutableMapOf<Int, MutableList<String>>()
+                        for ((line, error) in errors) {
+                            errorsByLine.getOrPut(line, ::mutableListOf).add(error)
+                        }
+                        source.lines().mapIndexed { index: Int, line: String ->
+                            Pair(
+                                line,
+                                errorsByLine[index] ?: emptyList<String>()
+                            )
+                        }
+                    } ?: lines.map { Pair(it, emptyList()) }
+                }
+                commentPreprocessor.convertFile(kws.value, file, outFile, javaTransform)
+            } else {
+                fsops.copy {
+                    from(file)
+                    into(outFile.parentFile)
+                }
+            }
+        }
+
+        if (commentPreprocessor.fail) {
+            throw GradleException("Failed to remap sources. See errors above for details.")
+        }
+    }
+
+    private fun makeMappings(
+        classpath: FileCollection?,
+        sourceMappingsFile: File?,
+        destinationMappingsFile: File?,
+        mapping: File?,
+    ): MappingSet? =
+        if (intermediateMappingsName.isPresent && classpath != null && sourceMappingsFile != null && destinationMappingsFile != null) {
             val sharedMappingsNamespace = intermediateMappingsName.get()
             val srcTree = MemoryMappingTree().also { MappingReader.read(sourceMappingsFile.toPath(), it) }
             val dstTree = MemoryMappingTree().also { MappingReader.read(destinationMappingsFile.toPath(), it) }
@@ -232,7 +543,8 @@ open class PreprocessTask @Inject constructor(
                         // The inner clsMap is to make the join work, the outer one for custom classes (which are not part of
                         // dstMap and would otherwise be filtered by the join)
                         srcMap.mergeBoth(clsMap).join(dstMap.reverse()).mergeBoth(clsMap),
-                        MappingSet.create(LegacyMappingSetModelFactory()))
+                        MappingSet.create(LegacyMappingSetModelFactory())
+                    )
                 } else {
                     val srcMap = sourceMappings!!
                     val dstMap = destinationMappings!!
@@ -263,97 +575,6 @@ open class PreprocessTask @Inject constructor(
         } else {
             null
         }
-        if (mappings != null) {
-            classpath!!
-            val javaTransformer = Transformer(mappings, mappingsList)
-            javaTransformer.verboseCompilerMessages = logger.isInfoEnabled
-            javaTransformer.patternAnnotation = patternAnnotation.orNull
-            javaTransformer.manageImports = manageImports.getOrElse(false)
-            javaTransformer.jdkHome = jdkHome.orNull?.asFile
-            javaTransformer.remappedJdkHome = remappedjdkHome.orNull?.asFile
-            LOGGER.debug("Remap Classpath:")
-            javaTransformer.classpath = classpath.files.mapNotNull {
-                if (it.exists()) {
-                    it.absolutePath.also(LOGGER::debug)
-                } else {
-                    LOGGER.debug("{} (file does not exist)", it)
-                    null
-                }
-            }.toTypedArray()
-            LOGGER.debug("Remapped Classpath:")
-            javaTransformer.remappedClasspath = remappedClasspath?.files?.mapNotNull {
-                if (it.exists()) {
-                    it.absolutePath.also(LOGGER::debug)
-                } else {
-                    LOGGER.debug("{} (file does not exist)", it)
-                    null
-                }
-            }?.toTypedArray()
-            val sources = mutableMapOf<String, String>()
-            val processedSources = mutableMapOf<String, String>()
-            sourceFiles.forEach { (relPath, inBase, _, _) ->
-                if (relPath.endsWith(".java") || relPath.endsWith(".kt")) {
-                    val text = String(Files.readAllBytes(inBase.resolve(relPath)))
-                    sources[relPath] = text
-                    val lines = text.lines()
-                    val kws = keywords.get().entries.find { (ext, _) -> relPath.endsWith(ext) }
-                    if (kws != null) {
-                        processedSources[relPath] = CommentPreprocessor(vars.get()).convertSource(
-                            kws.value,
-                            lines,
-                            lines.map { Pair(it, emptyList()) },
-                            relPath
-                        ).joinToString("\n")
-                    }
-                }
-            }
-            val overwritesFiles = entries
-                .mapNotNull { it.overwrites }
-                .flatMap { base -> layout.files(base).asFileTree.map { Pair(base.toPath(), it) } }
-            overwritesFiles.forEach { (base, file) ->
-                if (file.name.endsWith(".java") || file.name.endsWith(".kt")) {
-                    val relPath = base.relativize(file.toPath())
-                    processedSources[relPath.toString()] = file.readText()
-                }
-            }
-            mappedSources = javaTransformer.remap(sources, processedSources)
-        }
-
-        fsops.delete {
-            delete(entries.map { it.generated })
-        }
-
-        val commentPreprocessor = CommentPreprocessor(vars.get())
-        sourceFiles.forEach { (relPath, inBase, outBase, overwritesPath) ->
-            val file = inBase.resolve(relPath).toFile()
-            val outFile = outBase.resolve(relPath).toFile()
-            if (overwritesPath != null && Files.exists(overwritesPath.resolve(relPath))) {
-                return@forEach
-            }
-            val kws = keywords.get().entries.find { (ext, _) -> file.name.endsWith(ext) }
-            if (kws != null) {
-                val javaTransform = { lines: List<String> ->
-                    mappedSources?.get(relPath)?.let { (source, errors) ->
-                        val errorsByLine = mutableMapOf<Int, MutableList<String>>()
-                        for ((line, error) in errors) {
-                            errorsByLine.getOrPut(line, ::mutableListOf).add(error)
-                        }
-                        source.lines().mapIndexed { index: Int, line: String -> Pair(line, errorsByLine[index] ?: emptyList<String>()) }
-                    } ?: lines.map { Pair(it, emptyList()) }
-                }
-                commentPreprocessor.convertFile(kws.value, file, outFile, javaTransform)
-            } else {
-                fsops.copy {
-                    from(file)
-                    into(outFile.parentFile)
-                }
-            }
-        }
-
-        if (commentPreprocessor.fail) {
-            throw GradleException("Failed to remap sources. See errors above for details.")
-        }
-    }
 
     /**
      * Tries to infer shared classes based on shared members.
@@ -527,9 +748,11 @@ open class PreprocessTask @Inject constructor(
                 val srcName = extField.getName(extSrcNsId)
                 val srcDesc = extField.getDesc(extSrcNsId)
                 if (srcDesc == null) {
-                    logger.error("Owner ${extCls.getName(extSrcNsId)} of field $srcName does not appear to have any mappings. " +
-                        "As such, you must provide the full signature of this method manually " +
-                        "(if it does not change across versions, providing it for either version is sufficient).")
+                    logger.error(
+                        "Owner ${extCls.getName(extSrcNsId)} of field $srcName does not appear to have any mappings. " +
+                                "As such, you must provide the full signature of this method manually " +
+                                "(if it does not change across versions, providing it for either version is sufficient)."
+                    )
                     continue
                 }
                 mrgTree.visitField(srcName, srcDesc)
@@ -539,9 +762,11 @@ open class PreprocessTask @Inject constructor(
                 val srcName = extMethod.getName(extSrcNsId)
                 val srcDesc = extMethod.getDesc(extSrcNsId)
                 if (srcDesc == null) {
-                    logger.error("Owner ${extCls.getName(extSrcNsId)} of method $srcName does not appear to have any mappings. " +
-                        "As such, you must provide the full signature of this method manually " +
-                        "(if it does not change across versions, providing it for either version is sufficient).")
+                    logger.error(
+                        "Owner ${extCls.getName(extSrcNsId)} of method $srcName does not appear to have any mappings. " +
+                                "As such, you must provide the full signature of this method manually " +
+                                "(if it does not change across versions, providing it for either version is sufficient)."
+                    )
                     continue
                 }
                 mrgTree.visitMethod(srcName, srcDesc)
@@ -564,30 +789,34 @@ open class PreprocessTask @Inject constructor(
             mrgTree.visitClass(srcCls.getName(srcNamedNsId))
             mrgTree.visitDstName(MappedElementKind.CLASS, 0, dstCls.getName(dstNamedNsId))
             for (srcField in srcCls.fields) {
-                val extField = extCls?.getField(srcField.getName(srcNamedNsId), srcField.getDesc(srcNamedNsId), extSrcNsId)
+                val extField =
+                    extCls?.getField(srcField.getName(srcNamedNsId), srcField.getDesc(srcNamedNsId), extSrcNsId)
                 if (extField != null) {
                     extCls.removeField(extField.srcName, extField.srcDesc)
                     mrgTree.visitField(srcField.getName(srcNamedNsId), srcField.getDesc(srcNamedNsId))
                     mrgTree.visitDstName(MappedElementKind.FIELD, 0, extField.getName(extDstNsId))
                     continue
                 }
-                val dstField = dstCls.getField(srcField.getName(srcSharedNsId), srcField.getDesc(srcSharedNsId), dstSharedNsId)
-                    ?: dstCls.getField(srcField.getName(srcSharedNsId), null, dstSharedNsId)
-                    ?: continue
+                val dstField =
+                    dstCls.getField(srcField.getName(srcSharedNsId), srcField.getDesc(srcSharedNsId), dstSharedNsId)
+                        ?: dstCls.getField(srcField.getName(srcSharedNsId), null, dstSharedNsId)
+                        ?: continue
                 mrgTree.visitField(srcField.getName(srcNamedNsId), srcField.getDesc(srcNamedNsId))
                 mrgTree.visitDstName(MappedElementKind.FIELD, 0, dstField.getName(dstNamedNsId))
             }
             for (srcMethod in srcCls.methods) {
-                val extMethod = extCls?.getMethod(srcMethod.getName(srcNamedNsId), srcMethod.getDesc(srcNamedNsId), extSrcNsId)
+                val extMethod =
+                    extCls?.getMethod(srcMethod.getName(srcNamedNsId), srcMethod.getDesc(srcNamedNsId), extSrcNsId)
                 if (extMethod != null) {
                     extCls.removeMethod(extMethod.srcName, extMethod.srcDesc)
                     mrgTree.visitMethod(srcMethod.getName(srcNamedNsId), srcMethod.getDesc(srcNamedNsId))
                     mrgTree.visitDstName(MappedElementKind.METHOD, 0, extMethod.getName(extDstNsId))
                     continue
                 }
-                val dstMethod = dstCls.getMethod(srcMethod.getName(srcSharedNsId), srcMethod.getDesc(srcSharedNsId), dstSharedNsId)
-                    ?: dstCls.getMethod(srcMethod.getName(srcSharedNsId), null, dstSharedNsId)
-                    ?: continue
+                val dstMethod =
+                    dstCls.getMethod(srcMethod.getName(srcSharedNsId), srcMethod.getDesc(srcSharedNsId), dstSharedNsId)
+                        ?: dstCls.getMethod(srcMethod.getName(srcSharedNsId), null, dstSharedNsId)
+                        ?: continue
                 mrgTree.visitMethod(srcMethod.getName(srcNamedNsId), srcMethod.getDesc(srcNamedNsId))
                 mrgTree.visitDstName(MappedElementKind.METHOD, 0, dstMethod.getName(dstNamedNsId))
             }
@@ -605,7 +834,7 @@ open class PreprocessTask @Inject constructor(
 }
 
 class CommentPreprocessor(
-    private val vars: Map<String, Int>
+    private val vars: Map<String, Int>,
 ) {
     companion object {
         private val EXPR_PATTERN = Pattern.compile("(.+)(==|!=|<=|>=|<|>)(.+)")
@@ -616,7 +845,8 @@ class CommentPreprocessor(
     var fail = false
 
     private fun String.evalVarOrNull() = cleanUpIfVersion().toIntOrNull() ?: vars[this]
-    private fun String.evalVar() = cleanUpIfVersion().evalVarOrNull() ?: throw NoSuchElementException("\'$this\' is not in $vars")
+    private fun String.evalVar() =
+        cleanUpIfVersion().evalVarOrNull() ?: throw NoSuchElementException("\'$this\' is not in $vars")
 
     private fun String.cleanUpIfVersion(): String {
         // Verify that this could be a version
@@ -677,7 +907,12 @@ class CommentPreprocessor(
     private val String.indentation: Int
         get() = takeWhile { it == ' ' }.length
 
-    fun convertSource(kws: Keywords, lines: List<String>, remapped: List<Pair<String, List<String>>>, fileName: String): List<String> {
+    fun convertSource(
+        kws: Keywords,
+        lines: List<String>,
+        remapped: List<Pair<String, List<String>>>,
+        fileName: String,
+    ): List<String> {
         val stack = mutableListOf<IfStackEntry>()
         val indentStack = mutableListOf<Int>()
         var active = true
@@ -810,7 +1045,12 @@ class CommentPreprocessor(
         }
     }
 
-    fun convertFile(kws: Keywords, inFile: File, outFile: File, remap: ((List<String>) -> List<Pair<String, List<String>>>)? = null) {
+    fun convertFile(
+        kws: Keywords,
+        inFile: File,
+        outFile: File,
+        remap: ((List<String>) -> List<Pair<String, List<String>>>)? = null,
+    ) {
         val string = inFile.readText()
         var lines = string.lines()
         val remapped = remap?.invoke(lines) ?: lines.map { Pair(it, emptyList()) }
@@ -830,7 +1070,7 @@ class CommentPreprocessor(
         var currentValue: Boolean,
         var lineno: Int,
         var elseFound: Boolean = false,
-        var trueFound: Boolean = false
+        var trueFound: Boolean = false,
     )
 
     class InvalidExpressionException(expr: String) : RuntimeException(expr)
