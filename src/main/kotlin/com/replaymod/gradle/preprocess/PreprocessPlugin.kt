@@ -15,15 +15,31 @@ import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.file.SourceDirectorySet
 import org.gradle.api.provider.Property
 import org.gradle.api.provider.Provider
-import org.gradle.api.tasks.*
+import org.gradle.api.tasks.CacheableTask
+import org.gradle.api.tasks.Copy
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputFile
+import org.gradle.api.tasks.Nested
+import org.gradle.api.tasks.Optional
+import org.gradle.api.tasks.OutputFile
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
+import org.gradle.api.tasks.SourceSetContainer
+import org.gradle.api.tasks.TaskAction
+import org.gradle.api.tasks.TaskProvider
 import org.gradle.api.tasks.compile.AbstractCompile
 import org.gradle.api.tasks.compile.JavaCompile
-
-import org.gradle.kotlin.dsl.*
+import org.gradle.kotlin.dsl.apply
+import org.gradle.kotlin.dsl.create
+import org.gradle.kotlin.dsl.extra
+import org.gradle.kotlin.dsl.get
+import org.gradle.kotlin.dsl.getByType
+import org.gradle.kotlin.dsl.register
+import org.gradle.kotlin.dsl.the
+import org.gradle.kotlin.dsl.withGroovyBuilder
+import org.gradle.kotlin.dsl.withType
 import java.io.ByteArrayInputStream
 import java.io.File
-import java.io.FileInputStream
-import java.io.ObjectInputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import java.util.stream.Collectors
@@ -74,6 +90,16 @@ class PreprocessPlugin : Plugin<Project> {
             val reverseMappings = (inheritedLink != null) != mappingFileInverted
             val inherited = parent.evaluationDependsOn(inheritedNode.project)
 
+            val mappingTempPath = project.layout.buildDirectory.file("tempMapping.txt")
+            val patternMappingTempPath = project.layout.buildDirectory.file("tempPatternMapping.bin")
+
+            val processedPatternMappings = project.tasks.register<ProcessPatternMappings>("createPatternMappings") {
+                this.mappingFile = mappingFile
+                this.patternMappings = patternMappings
+                this.destination.set(mappingTempPath)
+                this.patternMappingsJson.set(patternMappingTempPath)
+            }
+
             project.afterEvaluate {
                 project.tasks.withType<PreprocessTask>().configureEach {
                     projectNaming = project.group.toString()
@@ -89,15 +115,6 @@ class PreprocessPlugin : Plugin<Project> {
                 val generatedKotlin = preprocessedRoot.dir("kotlin")
                 val generatedJava = preprocessedRoot.dir("java")
                 val generatedResources = preprocessedRoot.dir("resources")
-                val mappingTempPath = project.layout.buildDirectory.file("tempMapping.txt")
-                val patternMappingTempPath = project.layout.buildDirectory.file("tempPatternMapping.bin")
-
-                val processedPatternMappings = project.tasks.register<ProcessPatternMappings>("createPatternMappings${cName}"){
-                    this.mappingFile = mappingFile
-                    this.patternMappings = patternMappings
-                    this.destination.set(mappingTempPath)
-                    this.patternMappingsJson.set(patternMappingTempPath)
-                }
 
                 val preprocessCode = project.tasks.register<PreprocessTask>("preprocess${cName}Code") {
                     dependsOn(processedPatternMappings)
@@ -398,7 +415,7 @@ internal abstract class BakeNamedToOfficialMappings : DefaultTask() {
 private fun Project.bakeNamedToIntermediaryMappings(
     name: String,
     namedToIntermediaryMappings: Mappings,
-    destination: File
+    destination: File,
 ): TaskProvider<BakeNamedToIntermediaryMappings> {
     val task = tasks.register(name, BakeNamedToIntermediaryMappings::class)
     task.configure {
@@ -413,7 +430,7 @@ private fun Project.bakeNamedToOfficialMappings(
     name: String,
     mappings: Mappings,
     namedToIntermediaryMappings: Mappings?,
-    destination: File
+    destination: File,
 ): TaskProvider<BakeNamedToOfficialMappings> {
     val task = tasks.register(name, BakeNamedToOfficialMappings::class)
     task.configure {
