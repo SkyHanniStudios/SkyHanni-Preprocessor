@@ -191,11 +191,13 @@ open class PreprocessTask @Inject constructor(
         set(value) {
             normalProjectImport = "import $value"
             commentedProjectImport = "//$$ import $value"
+            packageName = "package $value"
             field = value
         }
 
     private var normalProjectImport = "import $projectNaming"
     private var commentedProjectImport = "//$$ import $projectNaming"
+    private var packageName = "package $projectNaming"
 
     fun entry(source: FileCollection, generated: File, overwrites: File) {
         entries.add(InOut(source, generated, overwrites))
@@ -370,23 +372,31 @@ open class PreprocessTask @Inject constructor(
     ) {
         val lines = (if (useFuture) entry.resolvedFuture else entry.resolvedSource).readLines()
 
-        for (line in lines) {
+        fun handleDirectory(dependency: Path) {
+            val subFiles = Files.newDirectoryStream(dependency) {
+                it.isRegularFile() && (it.extension == "java" || it.extension == "kt")
+            }.toList()
+            solved.add(dependency)
+            solved.addAll(subFiles)
+            val newEntries = subFiles.map { entry.makeCopyAbsoluteOut(it) }
+            result.addAll(newEntries)
+            newEntries.forEach {
+                cascadingDependencyResolution(prefix, it, solved, result, true)
+            }
+        }
+
+        val packageIn = lines.first().substring(packageName.length + 1).trim().trimEnd(';')
+
+        handleDirectory(entry.outBase.resolve(Paths.get(prefix, packageIn.convertedDotToPath())))
+
+        for (line in lines.drop(2)) {
             val import = line.resolveImport()?.convertedDotToPath() ?: continue
             val dependency = entry.findFirstDirOrFileUnderOut(prefix, import)
 
             if (solved.contains(dependency)) continue
 
             if (dependency.isDirectory()) {
-                val subFiles =
-                    Files.newDirectoryStream(dependency) { it.isRegularFile() && (it.extension == "java" || it.extension == "kt") }
-                        .toList()
-                solved.add(dependency)
-                solved.addAll(subFiles)
-                val newEntries = subFiles.map { entry.makeCopyAbsoluteOut(it) }
-                result.addAll(newEntries)
-                newEntries.forEach {
-                    cascadingDependencyResolution(prefix, it, solved, result, true)
-                }
+                handleDirectory(dependency)
             } else {
                 solved.add(dependency)
                 val newEntry = entry.makeCopyAbsoluteOut(dependency)
