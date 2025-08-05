@@ -15,6 +15,7 @@ import org.gradle.api.file.ConfigurableFileCollection
 import org.gradle.api.file.FileCollection
 import org.gradle.api.file.FileSystemOperations
 import org.gradle.api.file.ProjectLayout
+import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.model.ObjectFactory
 import org.gradle.api.tasks.CacheableTask
 import org.gradle.api.tasks.Input
@@ -37,6 +38,8 @@ import org.jetbrains.kotlin.backend.common.pop
 import org.jetbrains.kotlin.backend.common.push
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.io.FileInputStream
+import java.io.ObjectInputStream
 import java.io.Serializable
 import java.nio.file.Files
 import java.nio.file.Path
@@ -140,14 +143,15 @@ open class PreprocessTask @Inject constructor(
     @InputFile
     @Optional
     @PathSensitive(PathSensitivity.NONE)
-    var mapping: File? = null
+    val mapping: RegularFileProperty = objects.fileProperty()
 
     @Input
     var reverseMapping: Boolean = false
 
-    @Input
+    @InputFile
     @Optional
-    var mappingsList: List<PatternMapping> = emptyList()
+    @PathSensitive(PathSensitivity.NONE)
+    val mappingsList: RegularFileProperty = objects.fileProperty()
 
     @InputDirectory
     @Optional
@@ -201,6 +205,8 @@ open class PreprocessTask @Inject constructor(
 
     @TaskAction
     fun preprocess(inputChanges: InputChanges) {
+
+        val mapping = mapping.takeIfThereAndNotEmpty()?.get()?.asFile
 
         if (!inputChanges.isIncremental || !incrementalFlag) {
             logger.lifecycle("Full Preprocess run")
@@ -411,6 +417,10 @@ open class PreprocessTask @Inject constructor(
 
         if (mappings != null) {
             classpath!!
+            val mappingsList: List<PatternMapping> = mappingsList.takeIfThereAndNotEmpty()?.let {
+                ObjectInputStream(FileInputStream(mappingsList.get().asFile)).use { (it.readObject() as List<*>).filterIsInstance<PatternMapping>() }
+            } ?: emptyList()
+
             val javaTransformer = Transformer(mappings, mappingsList)
             javaTransformer.verboseCompilerMessages = logger.isInfoEnabled
             javaTransformer.patternAnnotation = patternAnnotation.orNull
@@ -1077,3 +1087,6 @@ class CommentPreprocessor(
 
     class ParserException(str: String) : RuntimeException(str)
 }
+
+private fun RegularFileProperty.takeIfThereAndNotEmpty() =
+    if (isPresent && get().asFile.exists() && get().asFile.reader().read() != -1) this else null

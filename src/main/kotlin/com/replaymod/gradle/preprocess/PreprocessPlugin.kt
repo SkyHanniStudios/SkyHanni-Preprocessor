@@ -1,6 +1,5 @@
 package com.replaymod.gradle.preprocess
 
-import com.replaymod.gradle.remap.PatternMapping
 import net.fabricmc.mappingio.MappingReader
 import net.fabricmc.mappingio.tree.MemoryMappingTree
 import org.cadixdev.lorenz.MappingSet
@@ -12,7 +11,6 @@ import org.gradle.api.Project
 import org.gradle.api.Task
 import org.gradle.api.file.Directory
 import org.gradle.api.file.FileCollection
-import org.gradle.api.file.RegularFile
 import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.file.SourceDirectorySet
 import org.gradle.api.provider.Property
@@ -24,44 +22,13 @@ import org.gradle.api.tasks.compile.JavaCompile
 import org.gradle.kotlin.dsl.*
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.ObjectInputStream
 import java.nio.charset.StandardCharsets
-import java.nio.file.Files
 import java.nio.file.Path
 import java.util.stream.Collectors
 
 class PreprocessPlugin : Plugin<Project> {
-
-    private val patternMappingsList = mutableListOf<PatternMapping>()
-
-    private fun processPatternMappings(
-        mappingFile: File?,
-        patternMappings: File?,
-        destination: Provider<RegularFile>
-    ): File? {
-        if (mappingFile == null || patternMappings == null) {
-            return mappingFile
-        }
-
-        val tempMappingFile = destination.get().asFile
-        tempMappingFile.deleteOnExit()
-        tempMappingFile.writeText(mappingFile.readText())
-
-        for (line in patternMappings.readLines()) {
-            if (line.trim { it <= ' ' }.startsWith("#") || line.trim { it <= ' ' }.isEmpty()) continue
-
-            val parts = line.split(" ".toRegex()).dropLastWhile { it.isEmpty() }.toTypedArray()
-
-            require(parts.size == 5)
-
-            val patternMapping = PatternMapping(parts[0], parts[1], parts[2], parts[3], parts[4])
-            val classMapping = "${patternMapping.newClass} ${patternMapping.oldClass}"
-            val methodMapping = "${patternMapping.newClass} ${patternMapping.newMethod} ${patternMapping.oldMethod}"
-
-            tempMappingFile.appendText("\n$classMapping\n$methodMapping")
-            patternMappingsList.add(patternMapping)
-        }
-        return tempMappingFile
-    }
 
     override fun apply(project: Project) {
         val parent = project.parent
@@ -123,8 +90,17 @@ class PreprocessPlugin : Plugin<Project> {
                 val generatedJava = preprocessedRoot.dir("java")
                 val generatedResources = preprocessedRoot.dir("resources")
                 val mappingTempPath = project.layout.buildDirectory.file("tempMapping.txt")
+                val patternMappingTempPath = project.layout.buildDirectory.file("tempPatternMapping.bin")
+
+                val processedPatternMappings = project.tasks.register<ProcessPatternMappings>("createPatternMappings${cName}"){
+                    this.mappingFile = mappingFile
+                    this.patternMappings = patternMappings
+                    this.destination.set(mappingTempPath)
+                    this.patternMappingsJson.set(patternMappingTempPath)
+                }
 
                 val preprocessCode = project.tasks.register<PreprocessTask>("preprocess${cName}Code") {
+                    dependsOn(processedPatternMappings)
                     inherited.tasks.findByPath("preprocess${cName}Code")?.let { dependsOn(it) }
                     entry(
                         source = inherited.files(inheritedSourceSet.java.srcDirs),
@@ -144,14 +120,9 @@ class PreprocessPlugin : Plugin<Project> {
                     remappedjdkHome.set((project.tasks["compileJava"] as JavaCompile).javaCompiler.map { it.metadata.installationPath })
                     classpath = inherited.tasks["compile${cName}${if (kotlin) "Kotlin" else "Java"}"].classpath
                     remappedClasspath = project.tasks["compile${cName}${if (kotlin) "Kotlin" else "Java"}"].classpath
-                    inputs.files(mappingFile, patternMappings)
-                    mapping = processPatternMappings(
-                        mappingFile,
-                        patternMappings,
-                        mappingTempPath
-                    )
+                    mapping.set(mappingTempPath)
                     reverseMapping = reverseMappings
-                    mappingsList = patternMappingsList
+                    mappingsList.set(patternMappingTempPath)
                     vars.convention(ext.vars)
                     keywords.convention(ext.keywords)
                     patternAnnotation.convention(ext.patternAnnotation)
