@@ -23,7 +23,7 @@ plugins {
 }
 
 group = "com.github.SkyHanniStudios"
-version = "1.0.1"
+version = "1.0.2"
 val githubProjectName = "SkyHanni-Preprocessor"
 
 kotlin {
