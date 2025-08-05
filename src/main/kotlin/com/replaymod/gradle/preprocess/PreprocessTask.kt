@@ -28,6 +28,7 @@ import org.gradle.api.tasks.OutputDirectories
 import org.gradle.api.tasks.PathSensitive
 import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
+import org.gradle.internal.cc.base.logger
 import org.gradle.kotlin.dsl.mapProperty
 import org.gradle.kotlin.dsl.property
 import org.gradle.work.ChangeType
@@ -316,18 +317,18 @@ open class PreprocessTask @Inject constructor(
         private val overwritesBase: Path?,
     ) {
 
-        init {
-            require(inBase != null || overwritesBase != null) {
-                "Entry without any source file"
-            }
-        }
-
         val resolveBase: Path? = inBase?.resolve(relPath)
         val resolveOut: Path = outBase.resolve(relPath)
         val resolveOverwrite: Path? = overwritesBase?.resolve(relPath)
         val isJavaOrKotlin = relPath.endsWith(".java") || relPath.endsWith(".kt")
         val hasOverwrite = resolveOverwrite?.isRegularFile() == true
         val hasBase = resolveBase?.isRegularFile() == true
+
+        init {
+            require(hasBase || hasOverwrite) {
+                "Entry without any source file. Rel: '$relPath', inBase: '$inBase', overwrite: '$overwritesBase', outBase : '$outBase'"
+            }
+        }
 
         val sourceBase: Path = (if (hasOverwrite) overwritesBase else inBase)!!
 
@@ -337,7 +338,12 @@ open class PreprocessTask @Inject constructor(
 
         fun makeCopy(relativePath: String) = Entry(relativePath, inBase, outBase, overwritesBase)
         fun makeCopyAbsoluteBase(absolutePath: Path) = makeCopy(inBase!!.relativize(absolutePath).pathString)
-        fun makeCopyAbsoluteOut(absolutePath: Path) = makeCopy(outBase.relativize(absolutePath).pathString)
+        fun makeCopyAbsoluteOut(absolutePath: Path) = try {
+            makeCopy(outBase.relativize(absolutePath).pathString)
+        } catch (e: Throwable) {
+            logger.error("Entry failed", e)
+            null
+        }
 
         fun findFirstDirOrFileUnderOut(prefix: String, fileLocation: String): Path {
             val combi = Paths.get(prefix, fileLocation)
@@ -360,7 +366,8 @@ open class PreprocessTask @Inject constructor(
 
     private fun String.removeImportAliases(prefixCount: Int): String {
         val end = indexOf(" as ", prefixCount)
-        return if (end == -1) substring(prefixCount).trim() else substring(prefixCount, end).trim()
+        return if (end == -1) substring(prefixCount).trim().trimEnd(';') else substring(prefixCount, end).trim()
+            .trimEnd(';')
     }
 
     private fun cascadingDependencyResolution(
@@ -377,17 +384,29 @@ open class PreprocessTask @Inject constructor(
                 it.isRegularFile() && (it.extension == "java" || it.extension == "kt")
             }.toList()
             solved.add(dependency)
-            solved.addAll(subFiles)
-            val newEntries = subFiles.map { entry.makeCopyAbsoluteOut(it) }
+            val newFiles = subFiles.filter { !solved.contains(it) }
+            solved.addAll(newFiles)
+            val newEntries = newFiles.mapNotNull { entry.makeCopyAbsoluteOut(it) }
             result.addAll(newEntries)
             newEntries.forEach {
                 cascadingDependencyResolution(prefix, it, solved, result, true)
             }
         }
 
-        val packageIn = lines.first().substring(packageName.length + 1).trim().trimEnd(';')
+        val rawPackageLine = lines.first()
 
-        handleDirectory(entry.outBase.resolve(Paths.get(prefix, packageIn.convertedDotToPath())))
+        val realPackageRange =
+            (packageName.length + 1) until (rawPackageLine.indexOf(' ', packageName.length + 1).takeIf { it != -1 }
+                ?: rawPackageLine.length)
+
+        val packageIn = if (realPackageRange.isEmpty()) "" else rawPackageLine.substring(realPackageRange).trim()
+            .trimEnd(';')
+
+        val packagePath = entry.outBase.resolve(Paths.get(prefix, packageIn.convertedDotToPath()))
+
+        if (!solved.contains(packagePath)) {
+            handleDirectory(packagePath)
+        }
 
         for (line in lines.drop(2)) {
             val import = line.resolveImport()?.convertedDotToPath() ?: continue
@@ -399,7 +418,7 @@ open class PreprocessTask @Inject constructor(
                 handleDirectory(dependency)
             } else {
                 solved.add(dependency)
-                val newEntry = entry.makeCopyAbsoluteOut(dependency)
+                val newEntry = entry.makeCopyAbsoluteOut(dependency) ?: continue
                 result.add(newEntry)
                 cascadingDependencyResolution(prefix, newEntry, solved, result, true)
             }
