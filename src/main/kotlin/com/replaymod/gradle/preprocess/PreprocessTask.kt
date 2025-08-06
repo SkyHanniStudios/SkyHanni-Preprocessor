@@ -28,7 +28,6 @@ import org.gradle.api.tasks.OutputDirectories
 import org.gradle.api.tasks.PathSensitive
 import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
-import org.gradle.internal.cc.base.logger
 import org.gradle.kotlin.dsl.mapProperty
 import org.gradle.kotlin.dsl.property
 import org.gradle.work.ChangeType
@@ -258,6 +257,8 @@ open class PreprocessTask @Inject constructor(
 
         val convertedCompanyName = projectNaming.convertedDotToPath()
 
+        val alternateBases = entries.flatMap { it.source }.map { it.toPath() }
+
         for (entry in sourceFiles) {
             if (!entry.isJavaOrKotlin) continue
 
@@ -271,7 +272,7 @@ open class PreprocessTask @Inject constructor(
                     ""
                 }
             }
-            cascadingDependencyResolution(walkDown, entry, solvedDependencies, dependencies)
+            cascadingDependencyResolution(walkDown, entry, solvedDependencies, dependencies, alternateBases)
         }
 
         logger.debug("dependencies: {}", dependencies)
@@ -338,11 +339,18 @@ open class PreprocessTask @Inject constructor(
 
         fun makeCopy(relativePath: String) = Entry(relativePath, inBase, outBase, overwritesBase)
         fun makeCopyAbsoluteBase(absolutePath: Path) = makeCopy(inBase!!.relativize(absolutePath).pathString)
-        fun makeCopyAbsoluteOut(absolutePath: Path) = try {
+        fun makeCopyAbsoluteOut(absolutePath: Path, alternateBases: List<Path>) = try {
             makeCopy(outBase.relativize(absolutePath).pathString)
         } catch (e: Throwable) {
-            logger.error("Entry failed", e)
-            null
+            val relPath = outBase.relativize(absolutePath).pathString
+
+            alternateBases.firstNotNullOfOrNull {
+                try {
+                    Entry(relPath, it, outBase, overwritesBase)
+                } catch (e: Throwable) {
+                    null
+                }
+            }
         }
 
         fun findFirstDirOrFileUnderOut(prefix: String, fileLocation: String): Path {
@@ -375,6 +383,7 @@ open class PreprocessTask @Inject constructor(
         entry: Entry,
         solved: MutableSet<Path>,
         result: MutableList<Entry>,
+        alternateBases: List<Path>,
         useFuture: Boolean = false,
     ) {
         val lines = (if (useFuture) entry.resolvedFuture else entry.resolvedSource).readLines()
@@ -386,10 +395,10 @@ open class PreprocessTask @Inject constructor(
             solved.add(dependency)
             val newFiles = subFiles.filter { !solved.contains(it) }
             solved.addAll(newFiles)
-            val newEntries = newFiles.mapNotNull { entry.makeCopyAbsoluteOut(it) }
+            val newEntries = newFiles.mapNotNull { entry.makeCopyAbsoluteOut(it, alternateBases) }
             result.addAll(newEntries)
             newEntries.forEach {
-                cascadingDependencyResolution(prefix, it, solved, result, true)
+                cascadingDependencyResolution(prefix, it, solved, result, alternateBases, true)
             }
         }
 
@@ -418,9 +427,9 @@ open class PreprocessTask @Inject constructor(
                 handleDirectory(dependency)
             } else {
                 solved.add(dependency)
-                val newEntry = entry.makeCopyAbsoluteOut(dependency) ?: continue
+                val newEntry = entry.makeCopyAbsoluteOut(dependency, alternateBases) ?: continue
                 result.add(newEntry)
-                cascadingDependencyResolution(prefix, newEntry, solved, result, true)
+                cascadingDependencyResolution(prefix, newEntry, solved, result, alternateBases, true)
             }
         }
     }
