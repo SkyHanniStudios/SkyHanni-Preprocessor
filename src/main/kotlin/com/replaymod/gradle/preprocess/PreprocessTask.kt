@@ -278,6 +278,10 @@ open class PreprocessTask @Inject constructor(
         logger.debug("dependencies: {}", dependencies)
         logger.lifecycle("Touching ${sourceFiles.size + dependencies.size} files")
 
+        fsops.delete {
+            delete(sourceFiles.map(Entry::resolveOut))
+        }
+
         preprocess(mapping, sourceFiles, dependencies)
     }
 
@@ -306,6 +310,10 @@ open class PreprocessTask @Inject constructor(
                     Entry(relPath.pathString, inOut.source.first().toPath(), inOut.generated.toPath(), base.toPath())
                 } else null
             }
+        }
+
+        fsops.delete {
+            delete(entries.map(InOut::generated))
         }
 
         preprocess(mapping, sourceFiles + onlyOverwrite, emptyList())
@@ -444,9 +452,7 @@ open class PreprocessTask @Inject constructor(
 
     private fun preprocess(mapping: File?, sourceFiles: List<Entry>, alreadyProcessedFiles: Collection<Entry>) {
 
-        fsops.delete {
-            delete(sourceFiles.map(Entry::resolveOut))
-        }
+
 
         var mappedSources: Map<String, Pair<String, List<Pair<Int, String>>>>? = null
 
