@@ -323,7 +323,7 @@ open class PreprocessTask @Inject constructor(
         val relPath: String,
         val inBase: Path?,
         val outBase: Path,
-        private val overwritesBase: Path?,
+        val overwritesBase: Path?,
     ) {
 
         val resolveBase: Path? = inBase?.resolve(relPath)
@@ -343,12 +343,11 @@ open class PreprocessTask @Inject constructor(
 
         val resolvedSource: Path = sourceBase.resolve(relPath)
 
-        val resolvedFuture: Path get() = if (resolveOut.isRegularFile()) resolveOut else resolveOverwrite ?: resolveBase!!
+        val resolvedFuture: Path get() = if (resolveOut.isRegularFile()) resolveOut else if (hasOverwrite) resolveOverwrite!! else resolveBase!!
 
         fun makeCopy(relativePath: String) = Entry(relativePath, inBase, outBase, overwritesBase)
-        fun makeCopyAbsoluteBase(absolutePath: Path) = makeCopy(inBase!!.relativize(absolutePath).pathString)
-        fun makeCopyAbsoluteOut(absolutePath: Path, alternateBases: List<Path>) = try {
-            makeCopy(outBase.relativize(absolutePath).pathString)
+        fun makeCopyAbsolute(absolutePath: Path, relativizeWith: Path, alternateBases: List<Path>) = try {
+            makeCopy(relativizeWith.relativize(absolutePath).pathString)
         } catch (e: Throwable) {
             val relPath = outBase.relativize(absolutePath).pathString
 
@@ -371,6 +370,18 @@ open class PreprocessTask @Inject constructor(
                 outBase.resolve(combi.pathString + it)
             }.firstOrNull { it.isRegularFile() }
                 ?: findFirstDirOrFileUnderOut(prefix, fileLocation.substringBeforeLast(pathDelimiter, ""))
+        }
+
+        fun findFirstDirOrFileUnderIn(prefix: String, fileLocation: String): Path {
+            val combi = Paths.get(prefix, fileLocation)
+            val baseResolved = inBase!!.resolve(combi)
+            if (baseResolved.isDirectory()) {
+                return baseResolved
+            }
+            return listOf(".kt", ".java").map {
+                inBase.resolve(combi.pathString + it)
+            }.firstOrNull { it.isRegularFile() }
+                ?: findFirstDirOrFileUnderIn(prefix, fileLocation.substringBeforeLast(pathDelimiter, ""))
         }
     }
 
@@ -396,16 +407,16 @@ open class PreprocessTask @Inject constructor(
     ) {
         val lines = (if (useFuture) entry.resolvedFuture else entry.resolvedSource).readLines()
 
-        if(lines.isEmpty()) return
+        if (lines.isEmpty()) return
 
-        fun handleDirectory(dependency: Path) {
+        fun handleDirectory(dependency: Path, relativeRoot: Path) {
             val subFiles = Files.newDirectoryStream(dependency) {
                 it.isRegularFile() && (it.extension == "java" || it.extension == "kt")
             }.toList()
             solved.add(dependency)
             val newFiles = subFiles.filter { !solved.contains(it) }
             solved.addAll(newFiles)
-            val newEntries = newFiles.mapNotNull { entry.makeCopyAbsoluteOut(it, alternateBases) }
+            val newEntries = newFiles.mapNotNull { entry.makeCopyAbsolute(it, relativeRoot, alternateBases) }
             result.addAll(newEntries)
             newEntries.forEach {
                 cascadingDependencyResolution(prefix, it, solved, result, alternateBases, true)
@@ -421,23 +432,32 @@ open class PreprocessTask @Inject constructor(
         val packageIn = if (realPackageRange.isEmpty()) "" else rawPackageLine.substring(realPackageRange).trim()
             .trimEnd(';')
 
-        val packagePath = entry.outBase.resolve(Paths.get(prefix, packageIn.convertedDotToPath()))
+        val packageRelativePath = Paths.get(prefix, packageIn.convertedDotToPath())
+
+        val (packagePath, packageRelativeRoot) = entry.outBase.resolve(packageRelativePath).let {
+            if (it.isDirectory()) it to entry.outBase else entry.overwritesBase!!.resolve(packageRelativePath) to entry.overwritesBase
+        }
 
         if (!solved.contains(packagePath)) {
-            handleDirectory(packagePath)
+            handleDirectory(packagePath, packageRelativeRoot)
         }
 
         for (line in lines.drop(2)) {
             val import = line.resolveImport()?.convertedDotToPath() ?: continue
-            val dependency = entry.findFirstDirOrFileUnderOut(prefix, import)
+            val outPath = entry.findFirstDirOrFileUnderOut(prefix, import)
+
+            val (dependency, relativeRoot) = if (outPath.isDirectory() && entry.inBase != null) {
+                val inPath = entry.findFirstDirOrFileUnderIn(prefix, import)
+                if (inPath.isRegularFile()) inPath to entry.inBase else outPath to entry.outBase
+            } else outPath to entry.outBase
 
             if (solved.contains(dependency)) continue
 
             if (dependency.isDirectory()) {
-                handleDirectory(dependency)
+                handleDirectory(dependency, relativeRoot)
             } else {
                 solved.add(dependency)
-                val newEntry = entry.makeCopyAbsoluteOut(dependency, alternateBases) ?: continue
+                val newEntry = entry.makeCopyAbsolute(dependency, relativeRoot, alternateBases) ?: continue
                 result.add(newEntry)
                 cascadingDependencyResolution(prefix, newEntry, solved, result, alternateBases, true)
             }
@@ -451,8 +471,6 @@ open class PreprocessTask @Inject constructor(
     }
 
     private fun preprocess(mapping: File?, sourceFiles: List<Entry>, alreadyProcessedFiles: Collection<Entry>) {
-
-
 
         var mappedSources: Map<String, Pair<String, List<Pair<Int, String>>>>? = null
 
