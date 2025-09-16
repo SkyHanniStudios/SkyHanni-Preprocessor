@@ -11,23 +11,9 @@ import net.fabricmc.mappingio.tree.MemoryMappingTree
 import org.cadixdev.lorenz.MappingSet
 import org.gradle.api.DefaultTask
 import org.gradle.api.GradleException
-import org.gradle.api.file.ConfigurableFileCollection
-import org.gradle.api.file.FileCollection
-import org.gradle.api.file.FileSystemOperations
-import org.gradle.api.file.ProjectLayout
-import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.file.*
 import org.gradle.api.model.ObjectFactory
-import org.gradle.api.tasks.CacheableTask
-import org.gradle.api.tasks.Input
-import org.gradle.api.tasks.InputDirectory
-import org.gradle.api.tasks.InputFile
-import org.gradle.api.tasks.InputFiles
-import org.gradle.api.tasks.Internal
-import org.gradle.api.tasks.Optional
-import org.gradle.api.tasks.OutputDirectories
-import org.gradle.api.tasks.PathSensitive
-import org.gradle.api.tasks.PathSensitivity
-import org.gradle.api.tasks.TaskAction
+import org.gradle.api.tasks.*
 import org.gradle.kotlin.dsl.mapProperty
 import org.gradle.kotlin.dsl.property
 import org.gradle.work.ChangeType
@@ -46,12 +32,7 @@ import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.regex.Pattern
 import javax.inject.Inject
-import kotlin.io.path.extension
-import kotlin.io.path.isDirectory
-import kotlin.io.path.isRegularFile
-import kotlin.io.path.pathString
-import kotlin.io.path.readLines
-import kotlin.io.path.readText
+import kotlin.io.path.*
 
 data class Keywords(
     val disableRemap: String,
@@ -63,8 +44,6 @@ data class Keywords(
     val endif: String,
     val eval: String,
 ) : Serializable
-
-private val pathDelimiter = Paths.get("\\").pathString
 
 @CacheableTask
 open class PreprocessTask @Inject constructor(
@@ -266,7 +245,7 @@ open class PreprocessTask @Inject constructor(
 
                 Files.walk(path).filter { Files.isDirectory(it) }.filter { it.endsWith(convertedCompanyName) }
                     .findFirst().orElse(null)?.let {
-                        path.relativize(it).pathString + pathDelimiter
+                        path.relativize(it).pathString + File.separator
                     } ?: run {
                     logger.error("Failed to find walkDown of '$convertedCompanyName' in entry '${entry.outBase}'")
                     ""
@@ -285,7 +264,7 @@ open class PreprocessTask @Inject constructor(
         preprocess(mapping, sourceFiles, dependencies)
     }
 
-    private fun String.convertedDotToPath(): String = Paths.get(replace('.', '\\')).pathString
+    private fun String.convertedDotToPath(): String = Paths.get(replace('.', File.separatorChar)).pathString
 
     fun preprocessAll(mapping: File?, entries: List<InOut>) {
 
@@ -369,7 +348,7 @@ open class PreprocessTask @Inject constructor(
             return listOf(".kt", ".java").map {
                 outBase.resolve(combi.pathString + it)
             }.firstOrNull { it.isRegularFile() }
-                ?: findFirstDirOrFileUnderOut(prefix, fileLocation.substringBeforeLast(pathDelimiter, ""))
+                ?: findFirstDirOrFileUnderOut(prefix, fileLocation.substringBeforeLast(File.separator, ""))
         }
 
         fun findFirstDirOrFileUnderIn(prefix: String, fileLocation: String): Path {
@@ -381,7 +360,7 @@ open class PreprocessTask @Inject constructor(
             return listOf(".kt", ".java").map {
                 inBase.resolve(combi.pathString + it)
             }.firstOrNull { it.isRegularFile() }
-                ?: findFirstDirOrFileUnderIn(prefix, fileLocation.substringBeforeLast(pathDelimiter, ""))
+                ?: findFirstDirOrFileUnderIn(prefix, fileLocation.substringBeforeLast(File.separator, ""))
         }
     }
 
