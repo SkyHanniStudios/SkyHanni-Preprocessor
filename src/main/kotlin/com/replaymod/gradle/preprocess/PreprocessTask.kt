@@ -410,9 +410,15 @@ open class PreprocessTask @Inject constructor(
         if (lines.isEmpty()) return
 
         fun handleDirectory(dependency: Path, relativeRoot: Path) {
-            val subFiles = Files.newDirectoryStream(dependency) {
-                it.isRegularFile() && (it.extension == "java" || it.extension == "kt")
-            }.toList()
+            val subFiles = if (dependency.isDirectory()) {
+                Files.newDirectoryStream(dependency) {
+                    it.isRegularFile() && (it.extension == "java" || it.extension == "kt")
+                }.toList()
+            } else {
+                // This is the case when the folder does not exist in the future, since it does not exist
+                // all sub files must already be inside the proccessing so we can ignore the dependecies
+                emptyList()
+            }
             solved.add(dependency)
             val newFiles = subFiles.filter { !solved.contains(it) }
             solved.addAll(newFiles)
