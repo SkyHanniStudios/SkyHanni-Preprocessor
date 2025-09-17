@@ -64,8 +64,6 @@ data class Keywords(
     val eval: String,
 ) : Serializable
 
-private val pathDelimiter = Paths.get("\\").pathString
-
 @CacheableTask
 open class PreprocessTask @Inject constructor(
     private val layout: ProjectLayout,
@@ -266,7 +264,7 @@ open class PreprocessTask @Inject constructor(
 
                 Files.walk(path).filter { Files.isDirectory(it) }.filter { it.endsWith(convertedCompanyName) }
                     .findFirst().orElse(null)?.let {
-                        path.relativize(it).pathString + pathDelimiter
+                        path.relativize(it).pathString + File.separator
                     } ?: run {
                     logger.error("Failed to find walkDown of '$convertedCompanyName' in entry '${entry.outBase}'")
                     ""
@@ -285,7 +283,7 @@ open class PreprocessTask @Inject constructor(
         preprocess(mapping, sourceFiles, dependencies)
     }
 
-    private fun String.convertedDotToPath(): String = Paths.get(replace('.', '\\')).pathString
+    private fun String.convertedDotToPath(): String = Paths.get(replace('.', File.separatorChar)).pathString
 
     fun preprocessAll(mapping: File?, entries: List<InOut>) {
 
@@ -369,7 +367,7 @@ open class PreprocessTask @Inject constructor(
             return listOf(".kt", ".java").map {
                 outBase.resolve(combi.pathString + it)
             }.firstOrNull { it.isRegularFile() }
-                ?: findFirstDirOrFileUnderOut(prefix, fileLocation.substringBeforeLast(pathDelimiter, ""))
+                ?: findFirstDirOrFileUnderOut(prefix, fileLocation.substringBeforeLast(File.separator, ""))
         }
 
         fun findFirstDirOrFileUnderIn(prefix: String, fileLocation: String): Path {
@@ -381,7 +379,7 @@ open class PreprocessTask @Inject constructor(
             return listOf(".kt", ".java").map {
                 inBase.resolve(combi.pathString + it)
             }.firstOrNull { it.isRegularFile() }
-                ?: findFirstDirOrFileUnderIn(prefix, fileLocation.substringBeforeLast(pathDelimiter, ""))
+                ?: findFirstDirOrFileUnderIn(prefix, fileLocation.substringBeforeLast(File.separator, ""))
         }
     }
 
