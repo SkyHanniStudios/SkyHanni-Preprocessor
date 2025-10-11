@@ -12,6 +12,7 @@ import org.cadixdev.lorenz.MappingSet
 import org.gradle.api.DefaultTask
 import org.gradle.api.GradleException
 import org.gradle.api.file.ConfigurableFileCollection
+import org.gradle.api.file.DeleteSpec
 import org.gradle.api.file.FileCollection
 import org.gradle.api.file.FileSystemOperations
 import org.gradle.api.file.ProjectLayout
@@ -276,11 +277,9 @@ open class PreprocessTask @Inject constructor(
         logger.debug("dependencies: {}", dependencies)
         logger.lifecycle("Touching ${sourceFiles.size + dependencies.size} files")
 
-        fsops.delete {
+        preprocess(mapping, sourceFiles, dependencies){
             delete(sourceFiles.map(Entry::resolveOut))
         }
-
-        preprocess(mapping, sourceFiles, dependencies)
     }
 
     private fun String.convertedDotToPath(): String = Paths.get(replace('.', File.separatorChar)).pathString
@@ -310,11 +309,9 @@ open class PreprocessTask @Inject constructor(
             }
         }
 
-        fsops.delete {
+        preprocess(mapping, sourceFiles + onlyOverwrite, emptyList()){
             delete(entries.map(InOut::generated))
         }
-
-        preprocess(mapping, sourceFiles + onlyOverwrite, emptyList())
     }
 
     private data class Entry(
@@ -474,7 +471,7 @@ open class PreprocessTask @Inject constructor(
         return filePath.startsWith(rootPath)
     }
 
-    private fun preprocess(mapping: File?, sourceFiles: List<Entry>, alreadyProcessedFiles: Collection<Entry>) {
+    private fun preprocess(mapping: File?, sourceFiles: List<Entry>, alreadyProcessedFiles: Collection<Entry>, whatToDelete: DeleteSpec.() -> Unit) {
 
         var mappedSources: Map<String, Pair<String, List<Pair<Int, String>>>>? = null
 
@@ -542,6 +539,8 @@ open class PreprocessTask @Inject constructor(
 
             mappedSources = javaTransformer.remap(sources, reference, processedSources)
         }
+
+        fsops.delete(whatToDelete)
 
         val commentPreprocessor = CommentPreprocessor(vars.get())
         sourceFiles.forEach { entry ->
